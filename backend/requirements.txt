@@ -1,0 +1,23 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.18
+websockets==14.1
+pydantic==2.10.3
+google-genai==1.20.0
+opencv-python-headless==4.10.0.84
+numpy==2.2.0
+ffmpeg-python==0.2.0
+aiofiles==24.1.0
+faster-whisper==1.1.0
+
+# YouTube регулярно меняет способ отдачи видео и субтитров, и старая версия
+# yt-dlp просто перестаёт извлекать данные. Версию не фиксируем — обновляйте
+# командой: pip install -U yt-dlp
+yt-dlp>=2025.1.15
+
+# Нужны для автоматической выгрузки на YouTube через Data API v3.
+# Импортируются лениво, поэтому без них приложение запустится,
+# но кнопка автопубликации на YouTube работать не будет.
+google-api-python-client>=2.150.0
+google-auth-oauthlib>=1.2.1
+google-auth-httplib2>=0.2.0
