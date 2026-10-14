@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import './App.css';
 
 import Header from './components/Header';
@@ -13,6 +13,8 @@ import ExportPanel from './components/ExportPanel';
 import SettingsModal from './components/SettingsModal';
 import AdManager from './components/AdManager';
 import SocialSharePanel from './components/SocialSharePanel';
+import OperationPanel from './components/OperationPanel';
+import useOperation, { isUnfinishedTranscription } from './hooks/useOperation';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 const SESSION_KEY = 'videopril.session.v1';
@@ -76,7 +78,6 @@ export default function App() {
   const [videoUrl, setVideoUrl] = useState(() => apiUrl(restoredSession.video?.video_url));
   const [transcript, setTranscript] = useState(null);
   const [subtitleContext, setSubtitleContext] = useState(() => restoredSession.subtitleContext || null);
-  const [transcribing, setTranscribing] = useState(false);
   const [importingSubtitles, setImportingSubtitles] = useState(false);
 
   const [analyzing, setAnalyzing] = useState(false);
@@ -114,6 +115,43 @@ export default function App() {
 
   const wsRef = useRef(null);
   const subtitleInputRef = useRef(null);
+  const afterChapterImportRef = useRef(false);
+
+  const handleTranscriptionCompleted = useCallback(async (directTranscript = null) => {
+    if (!video?.video_id) return;
+    try {
+      const data = directTranscript?.full_text && !directTranscript?.operation_id
+        ? directTranscript
+        : await readApiResponse(
+          await fetch(`${API}/api/video/transcript/${video.video_id}`),
+        );
+      if (!data?.full_text && !data?.has_transcript) return;
+      setTranscript({ ...data, has_transcript: true });
+      setSubtitleNotice(
+        afterChapterImportRef.current
+          ? 'Карта глав и полный транскрипт готовы. Выделяйте текст справа для ручной нарезки.'
+          : 'Полный транскрипт готов. Выделяйте текст справа для ручной нарезки.',
+      );
+      afterChapterImportRef.current = false;
+    } catch {
+      // The operation panel keeps the completed state; polling can retry the file.
+    }
+  }, [video?.video_id]);
+
+  const {
+    operation: transcriptionOperation,
+    error: operationError,
+    pendingAction: operationPendingAction,
+    start: startTranscription,
+    pause: pauseTranscription,
+    resume: resumeTranscription,
+    stop: stopTranscription,
+  } = useOperation({
+    apiBase: API,
+    videoId: video?.video_id,
+    onCompleted: handleTranscriptionCompleted,
+  });
+  const transcribing = isUnfinishedTranscription(transcriptionOperation);
 
   useEffect(() => {
     if (!video) {
@@ -289,26 +327,11 @@ export default function App() {
   // ── Transcribe (Whisper) ───────────────────────────────────────────────────
   const handleTranscribe = async ({ afterChapterImport = false } = {}) => {
     if (!video) return;
-    setTranscribing(true);
-    setProgress({ pct: 5, msg: 'Подготавливаю Whisper для распознавания речи...', step: 'transcribing' });
-
+    afterChapterImportRef.current = afterChapterImport;
     try {
-      const r = await fetch(`${API}/api/video/transcribe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_id: video.video_id }),
-      });
-      const data = await readApiResponse(r);
-      setTranscript({ ...data, has_transcript: true });
-      setSubtitleNotice(
-        afterChapterImport
-          ? 'Карта глав и полный транскрипт готовы. Выделяйте текст справа для ручной нарезки.'
-          : 'Полный транскрипт готов. Выделяйте текст справа для ручной нарезки.'
-      );
-    } catch (err) {
-      alert('Ошибка транскрипции: ' + err.message);
-    } finally {
-      setTranscribing(false);
+      await startTranscription();
+    } catch {
+      // The operation hook renders the server error without discarding progress.
     }
   };
 
@@ -695,8 +718,17 @@ export default function App() {
           </div>
         )}
 
+        <OperationPanel
+          operation={transcriptionOperation}
+          error={operationError}
+          pendingAction={operationPendingAction}
+          onPause={pauseTranscription}
+          onResume={resumeTranscription}
+          onStop={stopTranscription}
+        />
+
         {/* ── Progress Overlay ────────────────────────────────────────────── */}
-        {(analyzing || transcribing || importingSubtitles || exporting || autoProcessing) && (
+        {(analyzing || importingSubtitles || exporting || autoProcessing) && (
           <div className="glass-card progress-overlay" style={{ marginBottom: 28 }}>
             <div className="progress-pct">{Math.min(progress.pct, 100)}%</div>
             <div className="progress-overlay-title">
