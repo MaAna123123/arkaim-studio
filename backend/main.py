@@ -25,6 +25,8 @@ try:
     from .transcriber import VideoTranscriber
     from .subtitle_parser import parse_srt_bytes
     from .social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
+    from .operation_manager import OperationManager
+    from .transcription_service import TranscriptionService
 except ImportError:
     from video_processor import VideoProcessor
     from ai_analyzer import VideoAIAnalyzer, generate_equal_chunks
@@ -32,6 +34,8 @@ except ImportError:
     from transcriber import VideoTranscriber
     from subtitle_parser import parse_srt_bytes
     from social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
+    from operation_manager import OperationManager
+    from transcription_service import TranscriptionService
 
 # ─────────────────────────────────────────────
 # Force ALL temp files & model caches to Drive X:
@@ -116,6 +120,7 @@ settings_store: dict = _load_settings()
 # Whisper нужен только как запасной вариант, когда у видео нет субтитров,
 # поэтому модель загружается лениво — при старте сервера её ждать не надо.
 transcriber = VideoTranscriber(model_size=settings_store.get("whisper_model", "small"))
+operation_manager = OperationManager()
 active_connections: list[WebSocket] = []
 
 # ─────────────────────────────────────────────
@@ -130,6 +135,13 @@ async def broadcast(message: dict):
             dead.append(ws)
     for ws in dead:
         active_connections.remove(ws)
+
+
+transcription_service = TranscriptionService(
+    operation_manager,
+    transcriber,
+    broadcast,
+)
 
 @app.websocket("/ws/progress")
 async def ws_progress(websocket: WebSocket):
