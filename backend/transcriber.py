@@ -13,11 +13,41 @@ transcriber.py — локальная транскрипция видео чер
   - Такое же качество распознавания
 """
 
+import copy
 import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Callable, Awaitable
+from typing import Callable
+
+try:
+    from .operation_manager import OperationControl
+except ImportError:
+    from operation_manager import OperationControl
+
+
+def merge_transcript_segments(
+    retained: list[dict],
+    resumed: list[dict],
+) -> list[dict]:
+    """Merge resumed output while removing segments repeated by the overlap."""
+    merged = copy.deepcopy(retained)
+    for candidate in resumed:
+        start = float(candidate.get("start", 0.0))
+        end = float(candidate.get("end", start))
+        duration = max(end - start, 0.001)
+        duplicate = False
+        for existing in merged:
+            existing_start = float(existing.get("start", 0.0))
+            existing_end = float(existing.get("end", existing_start))
+            overlap = max(0.0, min(end, existing_end) - max(start, existing_start))
+            shorter = min(duration, max(existing_end - existing_start, 0.001))
+            if overlap / shorter >= 0.5:
+                duplicate = True
+                break
+        if not duplicate:
+            merged.append(copy.deepcopy(candidate))
+    return sorted(merged, key=lambda item: (item.get("start", 0), item.get("end", 0)))
 
 
 class VideoTranscriber:
@@ -80,8 +110,12 @@ class VideoTranscriber:
     def transcribe(
         self,
         video_path: str,
-        language: str = None,  # None = автоопределение
+        language: str | None = None,  # None = автоопределение
         on_progress: Callable[[str, int], None] | None = None,
+        control: OperationControl | None = None,
+        on_partial: Callable[[dict], None] | None = None,
+        resume_from: float = 0.0,
+        retained_result: dict | None = None,
     ) -> dict:
         """
         Основной метод транскрипции.
@@ -114,33 +148,40 @@ class VideoTranscriber:
 
             _prog("Транскрибирую речь... (это займёт несколько минут)", 25)
 
-            segments_gen, info = model.transcribe(
-                audio_path,
-                language=language,
-                word_timestamps=True,       # таймкод каждого слова
-                vad_filter=True,            # фильтр тишины — пропускаем паузы
-                vad_parameters={"min_silence_duration_ms": 500},
-                beam_size=1,
-                best_of=1,
-                condition_on_previous_text=False,
-            )
+            transcribe_options = {
+                "language": language,
+                "word_timestamps": True,
+                "vad_filter": True,
+                "vad_parameters": {"min_silence_duration_ms": 500},
+                "beam_size": 1,
+                "best_of": 1,
+                "condition_on_previous_text": False,
+            }
+            if resume_from > 0:
+                transcribe_options["clip_timestamps"] = [max(0.0, resume_from - 1.0)]
+            segments_gen, info = model.transcribe(audio_path, **transcribe_options)
 
             _prog(f"Распознаю речь (язык: {info.language})...", 40)
 
-            # Собираем все сегменты
-            all_segments = []
-            all_words = []
-            full_text_parts = []
+            all_segments = copy.deepcopy((retained_result or {}).get("segments", []))
             last_reported_pct = 40
+            is_complete = True
+            iterator = iter(segments_gen)
 
-            for seg in segments_gen:
+            while True:
+                if control is not None and not control.wait_if_paused():
+                    is_complete = False
+                    break
+                try:
+                    seg = next(iterator)
+                except StopIteration:
+                    break
                 seg_data = {
                     "start": round(seg.start, 3),
                     "end": round(seg.end, 3),
                     "text": seg.text.strip(),
                     "words": [],
                 }
-                full_text_parts.append(seg.text.strip())
 
                 if seg.words:
                     for w in seg.words:
@@ -151,9 +192,17 @@ class VideoTranscriber:
                             "probability": round(w.probability, 3),
                         }
                         seg_data["words"].append(word_data)
-                        all_words.append(word_data)
 
-                all_segments.append(seg_data)
+                all_segments = merge_transcript_segments(all_segments, [seg_data])
+
+                partial = self._build_result(
+                    all_segments,
+                    info,
+                    retained_result,
+                    is_complete=False,
+                )
+                if on_partial:
+                    on_partial(copy.deepcopy(partial))
 
                 # faster-whisper performs most of the work while this generator
                 # is consumed. Report progress by the latest processed timestamp
@@ -169,26 +218,68 @@ class VideoTranscriber:
                         )
                         last_reported_pct = speech_pct
 
-            _prog("Формирую параграфы и блоки...", 85)
+            if is_complete:
+                _prog("Формирую параграфы и блоки...", 85)
+                _prog("Транскрипция завершена!", 100)
+            else:
+                _prog("Транскрипция остановлена, прогресс сохранён", last_reported_pct)
 
-            paragraphs = self._build_paragraphs(all_segments, pause_threshold=2.0)
-            full_text = " ".join(full_text_parts)
-
-            _prog("Транскрипция завершена!", 100)
-
-            return {
-                "full_text": full_text,
-                "language": info.language,
-                "language_probability": round(info.language_probability, 3),
-                "duration": round(info.duration, 2),
-                "segments": all_segments,
-                "words": all_words,
-                "paragraphs": paragraphs,
-            }
+            return self._build_result(
+                all_segments,
+                info,
+                retained_result,
+                is_complete=is_complete,
+            )
 
         finally:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _build_result(
+        self,
+        segments: list[dict],
+        info,
+        retained_result: dict | None,
+        is_complete: bool,
+    ) -> dict:
+        all_words = [
+            copy.deepcopy(word)
+            for segment in segments
+            for word in segment.get("words", [])
+        ]
+        full_text = " ".join(
+            segment.get("text", "").strip()
+            for segment in segments
+            if segment.get("text", "").strip()
+        )
+        checkpoint = max(
+            (float(segment.get("end", 0.0)) for segment in segments),
+            default=float((retained_result or {}).get("checkpoint", 0.0)),
+        )
+        return {
+            "full_text": full_text,
+            "language": getattr(info, "language", None)
+            or (retained_result or {}).get("language"),
+            "language_probability": round(
+                float(
+                    getattr(info, "language_probability", 0.0)
+                    or (retained_result or {}).get("language_probability", 0.0)
+                ),
+                3,
+            ),
+            "duration": round(
+                float(
+                    getattr(info, "duration", 0.0)
+                    or (retained_result or {}).get("duration", 0.0)
+                ),
+                2,
+            ),
+            "segments": copy.deepcopy(segments),
+            "words": all_words,
+            "paragraphs": self._build_paragraphs(segments, pause_threshold=2.0),
+            "checkpoint": round(checkpoint, 3),
+            "is_complete": is_complete,
+        }
 
     def _build_paragraphs(
         self,
