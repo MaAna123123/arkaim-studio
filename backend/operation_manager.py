@@ -114,6 +114,21 @@ class OperationManager:
             record = self._find_record(operation_type, video_id, statuses)
             return self._snapshot(record) if record is not None else None
 
+    def list_operations(
+        self,
+        video_id: str | None = None,
+        active_only: bool = False,
+    ) -> list[dict]:
+        with self._lock:
+            records = [
+                record
+                for record in self._records.values()
+                if (video_id is None or record["video_id"] == video_id)
+                and (not active_only or record["status"] in RESUMABLE_STATUSES)
+            ]
+            records.sort(key=lambda item: item["created_at"], reverse=True)
+            return [self._snapshot(record) for record in records]
+
     def transition(self, operation_id: str, target: str) -> dict:
         with self._lock:
             record = self._records.get(operation_id)

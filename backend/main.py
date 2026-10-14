@@ -25,7 +25,7 @@ try:
     from .transcriber import VideoTranscriber
     from .subtitle_parser import parse_srt_bytes
     from .social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
-    from .operation_manager import OperationManager
+    from .operation_manager import OperationConflictError, OperationManager
     from .transcription_service import TranscriptionService
 except ImportError:
     from video_processor import VideoProcessor
@@ -34,7 +34,7 @@ except ImportError:
     from transcriber import VideoTranscriber
     from subtitle_parser import parse_srt_bytes
     from social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
-    from operation_manager import OperationManager
+    from operation_manager import OperationConflictError, OperationManager
     from transcription_service import TranscriptionService
 
 # ─────────────────────────────────────────────
@@ -753,26 +753,66 @@ async def transcribe_video(req: TranscribeRequest):
         with open(transcript_file, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    await broadcast({"type": "progress", "step": "transcribing", "pct": 5, "msg": "Запуск Whisper..."})
+    existing = operation_manager.find_for_video(req.video_id, include_stopped=True)
+    operation = transcription_service.start(
+        req.video_id,
+        str(video_path),
+        req.language,
+        transcript_file,
+        asyncio.get_running_loop(),
+    )
+    return JSONResponse(
+        content=operation,
+        status_code=200 if existing is not None else 202,
+    )
 
-    loop = asyncio.get_running_loop()
-    def sync_progress(msg: str, pct: int):
-        asyncio.run_coroutine_threadsafe(
-            broadcast({"type": "progress", "step": "transcribing", "pct": pct, "msg": msg}),
-            loop
+
+@app.get("/api/operations")
+async def list_operations(video_id: str | None = None, active: bool = False):
+    return {
+        "operations": operation_manager.list_operations(
+            video_id=video_id,
+            active_only=active,
         )
+    }
 
+
+@app.get("/api/operations/{operation_id}")
+async def get_operation(operation_id: str):
+    operation = operation_manager.get(operation_id)
+    if operation is None:
+        raise HTTPException(status_code=404, detail="Операция не найдена")
+    return operation
+
+
+def _run_operation_action(operation_id: str, action: str) -> dict:
+    if operation_manager.get(operation_id) is None:
+        raise HTTPException(status_code=404, detail="Операция не найдена")
     try:
-        data = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: transcriber.transcribe(str(video_path), req.language, sync_progress)
-        )
-        with open(transcript_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        if action == "pause":
+            return transcription_service.pause(operation_id)
+        if action == "resume":
+            return transcription_service.resume(operation_id, asyncio.get_running_loop())
+        if action == "stop":
+            return transcription_service.stop(operation_id)
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=404, detail="Неизвестная команда операции")
 
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка транскрипции: {str(e)}")
+
+@app.post("/api/operations/{operation_id}/pause")
+async def pause_operation(operation_id: str):
+    return _run_operation_action(operation_id, "pause")
+
+
+@app.post("/api/operations/{operation_id}/resume")
+async def resume_operation(operation_id: str):
+    return _run_operation_action(operation_id, "resume")
+
+
+@app.post("/api/operations/{operation_id}/stop")
+async def stop_operation(operation_id: str):
+    return _run_operation_action(operation_id, "stop")
 
 
 @app.post("/api/video/transcript/import")
@@ -833,6 +873,18 @@ async def analyze_video(req: AnalyzeRequest):
         await broadcast({"type": "progress", "step": "analyzing", "pct": pct, "msg": msg})
 
     if req.mode == "transcript":
+        unfinished = operation_manager.find_for_video(
+            req.video_id,
+            include_stopped=True,
+        )
+        if unfinished is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Whisper ещё не завершён. Продолжите или завершите "
+                    "транскрипцию перед анализом."
+                ),
+            )
         # Читаем транскрипт или запускаем транскрипцию если её нет
         transcript_file = TRANSCRIPTS_DIR / f"{req.video_id}.json"
         if not transcript_file.exists():
