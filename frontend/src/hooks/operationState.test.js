@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  canApplyOperationSnapshot,
   formatEta,
   getOperationActions,
   isUnfinishedTranscription,
@@ -65,6 +66,17 @@ test('operation events are scoped to the displayed operation and video', () => {
       'video-1',
     ),
     false,
+  );
+});
+
+test('a trusted start response can replace a failed operation', () => {
+  const failed = { operation_id: 'old-op', video_id: 'video-1', status: 'failed' };
+  const retry = { operation_id: 'new-op', video_id: 'video-1', status: 'queued' };
+
+  assert.equal(canApplyOperationSnapshot(retry, failed, 'video-1'), false);
+  assert.equal(
+    canApplyOperationSnapshot(retry, failed, 'video-1', { claim: true }),
+    true,
   );
 });
 

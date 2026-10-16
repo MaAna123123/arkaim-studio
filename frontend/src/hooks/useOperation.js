@@ -21,6 +21,18 @@ export function matchesOperationEvent(event, currentOperation, videoId) {
     && event.operation_id === currentOperation.operation_id;
 }
 
+export function canApplyOperationSnapshot(
+  snapshot,
+  currentOperation,
+  videoId,
+  { claim = false } = {},
+) {
+  if (!snapshot?.operation_id || snapshot.video_id !== videoId) return false;
+  if (claim) return true;
+  return Boolean(currentOperation?.operation_id)
+    && currentOperation.operation_id === snapshot.operation_id;
+}
+
 export function formatEta(value) {
   if (value === null || value === undefined || value === '') return '—';
   const seconds = Number(value);
@@ -61,16 +73,13 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
       generation = generationRef.current,
       expectedVideo = videoId,
     } = options;
-    if (
-      !snapshot?.operation_id
-      || generation !== generationRef.current
-      || snapshot.video_id !== expectedVideo
-    ) return false;
-    if (operationRef.current?.operation_id) {
-      if (operationRef.current.operation_id !== snapshot.operation_id) return false;
-    } else if (!claim) {
-      return false;
-    }
+    if (generation !== generationRef.current) return false;
+    if (!canApplyOperationSnapshot(
+      snapshot,
+      operationRef.current,
+      expectedVideo,
+      { claim },
+    )) return false;
     operationRef.current = snapshot;
     setOperation(snapshot);
     setError(snapshot.error || '');
