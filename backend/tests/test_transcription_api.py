@@ -33,6 +33,12 @@ class FakeTranscriptionService:
     def stop(self, operation_id):
         return self.manager.transition(operation_id, "stopped")
 
+    async def wait_for_terminal(self, operation_id):
+        return self.manager.get(operation_id)
+
+    async def shutdown(self, timeout=2.0):
+        return None
+
 
 class TranscriptionApiTests(unittest.TestCase):
     def setUp(self):
@@ -141,6 +147,39 @@ class TranscriptionApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("Whisper", response.json()["detail"])
+
+    def test_transcript_analysis_uses_managed_service_for_missing_transcript(self):
+        service = self.service
+
+        def completed_start(video_id, _video_path, _language, transcript_path, _loop):
+            operation = service.manager.create("transcription", video_id)
+            service.manager.transition(operation["operation_id"], "running")
+            Path(transcript_path).write_text(
+                json.dumps({"full_text": "готово", "segments": [], "words": []}),
+                encoding="utf-8",
+            )
+            return service.manager.transition(operation["operation_id"], "completed")
+
+        class FakeAnalyzer:
+            async def analyze_from_transcript(self, _data, _prompt, _progress):
+                return []
+
+        with (
+            patch.object(service, "start", side_effect=completed_start),
+            patch.object(main, "_build_analyzer", return_value=FakeAnalyzer()),
+            patch.object(
+                main.transcriber,
+                "transcribe",
+                side_effect=AssertionError("analysis bypassed TranscriptionService"),
+            ),
+        ):
+            response = self.client.post(
+                "/api/video/analyze",
+                json={"video_id": "video-1", "mode": "transcript", "prompt": ""},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"segments": []})
 
 
 class OperationWebSocketPayloadTests(unittest.IsolatedAsyncioTestCase):

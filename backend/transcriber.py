@@ -30,11 +30,38 @@ def merge_transcript_segments(
     retained: list[dict],
     resumed: list[dict],
 ) -> list[dict]:
-    """Merge resumed output while removing segments repeated by the overlap."""
+    """Merge resumed output without losing a segment tail at the checkpoint."""
     merged = copy.deepcopy(retained)
+    checkpoint = max(
+        (float(segment.get("end", 0.0)) for segment in retained),
+        default=0.0,
+    )
+    epsilon = 0.02
     for candidate in resumed:
+        candidate = copy.deepcopy(candidate)
         start = float(candidate.get("start", 0.0))
         end = float(candidate.get("end", start))
+
+        words = candidate.get("words") or []
+        if words and start < checkpoint + epsilon:
+            kept_words = [
+                copy.deepcopy(word)
+                for word in words
+                if float(word.get("end", word.get("start", 0.0))) > checkpoint + epsilon
+            ]
+            if not kept_words:
+                continue
+            candidate["words"] = kept_words
+            candidate["start"] = float(kept_words[0].get("start", checkpoint))
+            candidate["end"] = float(kept_words[-1].get("end", candidate["start"]))
+            candidate["text"] = " ".join(
+                str(word.get("word", "")).strip()
+                for word in kept_words
+                if str(word.get("word", "")).strip()
+            )
+            start = float(candidate["start"])
+            end = float(candidate["end"])
+
         duration = max(end - start, 0.001)
         duplicate = False
         for existing in merged:
@@ -46,7 +73,7 @@ def merge_transcript_segments(
                 duplicate = True
                 break
         if not duplicate:
-            merged.append(copy.deepcopy(candidate))
+            merged.append(candidate)
     return sorted(merged, key=lambda item: (item.get("start", 0), item.get("end", 0)))
 
 
@@ -114,6 +141,7 @@ class VideoTranscriber:
         on_progress: Callable[[str, int], None] | None = None,
         control: OperationControl | None = None,
         on_partial: Callable[[dict], None] | None = None,
+        on_control_state: Callable[[str], None] | None = None,
         resume_from: float = 0.0,
         retained_result: dict | None = None,
     ) -> dict:
@@ -169,9 +197,22 @@ class VideoTranscriber:
             iterator = iter(segments_gen)
 
             while True:
-                if control is not None and not control.wait_if_paused():
-                    is_complete = False
-                    break
+                if control is not None:
+                    if control.stop_requested:
+                        if on_control_state:
+                            on_control_state("stopped")
+                        is_complete = False
+                        break
+                    if control.pause_requested:
+                        if on_control_state:
+                            on_control_state("paused")
+                        if not control.wait_if_paused():
+                            if on_control_state:
+                                on_control_state("stopped")
+                            is_complete = False
+                            break
+                        if on_control_state:
+                            on_control_state("running")
                 try:
                     seg = next(iterator)
                 except StopIteration:

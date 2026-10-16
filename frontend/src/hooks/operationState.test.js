@@ -55,6 +55,17 @@ test('operation events are scoped to the displayed operation and video', () => {
     ),
     false,
   );
+  assert.equal(
+    matchesOperationEvent(
+      {
+        type: 'operation', operation_type: 'transcription',
+        operation_id: 'unclaimed', video_id: 'video-1',
+      },
+      null,
+      'video-1',
+    ),
+    false,
+  );
 });
 
 test('eta is formatted without exposing invalid values', () => {

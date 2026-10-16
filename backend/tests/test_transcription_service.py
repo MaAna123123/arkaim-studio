@@ -13,7 +13,7 @@ PROJECT_ROOT = BACKEND_DIR.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from operation_manager import OperationManager  # noqa: E402
+from operation_manager import OperationConflictError, OperationManager  # noqa: E402
 from transcription_service import TranscriptionService  # noqa: E402
 
 
@@ -39,6 +39,7 @@ class ControllableTranscriber:
         self.first_started = threading.Event()
         self.first_returned = threading.Event()
         self.second_started = threading.Event()
+        self.paused = threading.Event()
         self.fail_after_partial = fail_after_partial
         self.calls = []
         self._lock = threading.Lock()
@@ -50,6 +51,7 @@ class ControllableTranscriber:
         on_progress=None,
         control=None,
         on_partial=None,
+        on_control_state=None,
         resume_from=0.0,
         retained_result=None,
     ):
@@ -71,8 +73,24 @@ class ControllableTranscriber:
         if self.fail_after_partial:
             raise RuntimeError("boom from fake worker")
 
+        pause_reported = False
         while not self.release.wait(0.01):
+            if control and control.pause_requested:
+                if not pause_reported and on_control_state:
+                    on_control_state("paused")
+                    pause_reported = True
+                    self.paused.set()
+                if not control.wait_if_paused():
+                    if on_control_state:
+                        on_control_state("stopped")
+                    self.first_returned.set()
+                    return current
+                if pause_reported and on_control_state:
+                    on_control_state("running")
+                    pause_reported = False
             if control and control.stop_requested:
+                if on_control_state:
+                    on_control_state("stopped")
                 self.first_returned.set()
                 return current
 
@@ -165,9 +183,10 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_event_set(transcriber.first_started)
 
         stopped = service.stop(operation["operation_id"])
-        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["status"], "running")
+        self.assertEqual(stopped["pending_action"], "stop")
         await self.assert_event_set(transcriber.first_returned)
-        await asyncio.sleep(0.05)
+        await self.wait_for_status(service, operation["operation_id"], "stopped")
 
         snapshot = service.manager.get(operation["operation_id"])
         self.assertEqual(snapshot["partial_result"]["checkpoint"], 2.0)
@@ -183,6 +202,7 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_event_set(transcriber.first_started)
         service.stop(operation["operation_id"])
         await self.assert_event_set(transcriber.first_returned)
+        await self.wait_for_status(service, operation["operation_id"], "stopped")
 
         resumed = service.resume(operation["operation_id"], loop)
         self.assertEqual(resumed["status"], "running")
@@ -213,6 +233,89 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("checkpoint", saved)
         self.assertEqual(len(transcriber.calls), 1)
         self.assertEqual(list(Path(self.temp_dir.name).glob("*.tmp-*")), [])
+
+        reused = service.start(
+            "video-1", "video.mp4", None, self.transcript_path, loop
+        )
+        self.assertEqual(reused["operation_id"], first["operation_id"])
+        self.assertEqual(reused["status"], "completed")
+        self.assertEqual(len(transcriber.calls), 1)
+
+    async def test_pause_and_resume_wait_for_worker_acknowledgement(self):
+        transcriber = ControllableTranscriber()
+        service = self.make_service(transcriber)
+        loop = asyncio.get_running_loop()
+        operation = service.start(
+            "video-1", "video.mp4", None, self.transcript_path, loop
+        )
+        await self.assert_event_set(transcriber.first_started)
+
+        requested = service.pause(operation["operation_id"])
+        self.assertEqual(requested["status"], "running")
+        self.assertEqual(requested["pending_action"], "pause")
+        await self.assert_event_set(transcriber.paused)
+        await self.wait_for_status(service, operation["operation_id"], "paused")
+
+        requested = service.resume(operation["operation_id"], loop)
+        self.assertEqual(requested["status"], "paused")
+        self.assertEqual(requested["pending_action"], "resume")
+        await self.wait_for_status(service, operation["operation_id"], "running")
+        transcriber.release.set()
+        await self.wait_for_status(service, operation["operation_id"], "completed")
+
+    async def test_shutdown_unblocks_paused_worker(self):
+        transcriber = ControllableTranscriber()
+        service = self.make_service(transcriber)
+        operation = service.start(
+            "video-1", "video.mp4", None, self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        await self.assert_event_set(transcriber.first_started)
+        service.pause(operation["operation_id"])
+        await self.assert_event_set(transcriber.paused)
+
+        await service.shutdown(timeout=0.5)
+
+        await self.assert_event_set(transcriber.first_returned)
+        self.assertEqual(
+            service.manager.get(operation["operation_id"])["status"], "stopped"
+        )
+
+    async def test_final_write_is_serialized_against_stop(self):
+        entered = threading.Event()
+        release_write = threading.Event()
+
+        class BlockingWriteService(TranscriptionService):
+            def _write_final_transcript(inner_self, path, operation_id, data):
+                entered.set()
+                release_write.wait(1.0)
+                return super(BlockingWriteService, inner_self)._write_final_transcript(
+                    path, operation_id, data
+                )
+
+        transcriber = ControllableTranscriber()
+        service = BlockingWriteService(OperationManager(), transcriber, self.publish)
+        operation = service.start(
+            "video-1", "video.mp4", None, self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        await self.assert_event_set(transcriber.first_started)
+        transcriber.release.set()
+        await self.assert_event_set(entered)
+
+        stop_task = asyncio.create_task(
+            asyncio.to_thread(service.stop, operation["operation_id"])
+        )
+        await asyncio.sleep(0.02)
+        self.assertFalse(stop_task.done())
+        release_write.set()
+        with self.assertRaises(OperationConflictError):
+            await stop_task
+        completed = await self.wait_for_status(
+            service, operation["operation_id"], "completed"
+        )
+        self.assertEqual(completed["pending_action"], None)
+        self.assertTrue(self.transcript_path.exists())
 
     async def test_worker_failure_retains_partial_and_sets_safe_error(self):
         transcriber = ControllableTranscriber(fail_after_partial=True)

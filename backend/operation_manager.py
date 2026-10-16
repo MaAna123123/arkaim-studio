@@ -29,6 +29,10 @@ class OperationControl:
     def stop_requested(self) -> bool:
         return self._stop.is_set()
 
+    @property
+    def pause_requested(self) -> bool:
+        return not self._can_run.is_set()
+
     def pause(self) -> None:
         self._can_run.clear()
 
@@ -85,6 +89,7 @@ class OperationManager:
                 "finished_at": None,
                 "eta_seconds": None,
                 "error": None,
+                "pending_action": None,
                 "partial_result": None,
                 "control": OperationControl(),
             }

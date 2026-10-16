@@ -17,10 +17,8 @@ export function getOperationActions(status) {
 
 export function matchesOperationEvent(event, currentOperation, videoId) {
   if (event?.type !== 'operation' || event.video_id !== videoId) return false;
-  if (currentOperation?.operation_id) {
-    return event.operation_id === currentOperation.operation_id;
-  }
-  return event.operation_type === 'transcription';
+  return Boolean(currentOperation?.operation_id)
+    && event.operation_id === currentOperation.operation_id;
 }
 
 export function formatEta(value) {
@@ -54,9 +52,25 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
   const [socketConnected, setSocketConnected] = useState(false);
   const operationRef = useRef(null);
   const completedRef = useRef(null);
+  const generationRef = useRef(0);
+  const requestControllersRef = useRef(new Set());
 
-  const applySnapshot = useCallback((snapshot) => {
-    if (!snapshot?.operation_id) return;
+  const applySnapshot = useCallback((snapshot, options = {}) => {
+    const {
+      claim = false,
+      generation = generationRef.current,
+      expectedVideo = videoId,
+    } = options;
+    if (
+      !snapshot?.operation_id
+      || generation !== generationRef.current
+      || snapshot.video_id !== expectedVideo
+    ) return false;
+    if (operationRef.current?.operation_id) {
+      if (operationRef.current.operation_id !== snapshot.operation_id) return false;
+    } else if (!claim) {
+      return false;
+    }
     operationRef.current = snapshot;
     setOperation(snapshot);
     setError(snapshot.error || '');
@@ -64,17 +78,32 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
       completedRef.current = snapshot.operation_id;
       onCompleted?.(snapshot);
     }
-  }, [onCompleted]);
+    return true;
+  }, [onCompleted, videoId]);
 
   const refresh = useCallback(async (operationId = operationRef.current?.operation_id) => {
     if (!operationId) return null;
-    const response = await fetch(`${apiBase}/api/operations/${operationId}`);
-    const snapshot = await readResponse(response);
-    applySnapshot(snapshot);
-    return snapshot;
-  }, [apiBase, applySnapshot]);
+    const generation = generationRef.current;
+    const expectedVideo = videoId;
+    const controller = new AbortController();
+    requestControllersRef.current.add(controller);
+    try {
+      const response = await fetch(`${apiBase}/api/operations/${operationId}`, {
+        signal: controller.signal,
+      });
+      const snapshot = await readResponse(response);
+      applySnapshot(snapshot, { generation, expectedVideo });
+      return snapshot;
+    } finally {
+      requestControllersRef.current.delete(controller);
+    }
+  }, [apiBase, applySnapshot, videoId]);
 
   useEffect(() => {
+    generationRef.current += 1;
+    const generation = generationRef.current;
+    requestControllersRef.current.forEach((controller) => controller.abort());
+    requestControllersRef.current.clear();
     operationRef.current = null;
     completedRef.current = null;
     setOperation(null);
@@ -93,13 +122,20 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
         const restored = data?.operations?.find(
           (item) => item.operation_type === 'transcription' && item.video_id === videoId,
         );
-        if (restored) applySnapshot(restored);
+        if (restored) applySnapshot(restored, {
+          claim: true,
+          generation,
+          expectedVideo: videoId,
+        });
       } catch (restoreError) {
         if (restoreError.name !== 'AbortError') setError(restoreError.message);
       }
     };
     restore();
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (generationRef.current === generation) generationRef.current += 1;
+    };
   }, [apiBase, videoId, applySnapshot]);
 
   useEffect(() => {
@@ -107,6 +143,7 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     let disposed = false;
     let reconnectTimer = null;
     let socket = null;
+    const generation = generationRef.current;
 
     const connect = () => {
       const baseUrl = new URL(apiBase, window.location.href);
@@ -116,16 +153,22 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
       socket.onmessage = (message) => {
         try {
           const event = JSON.parse(message.data);
-          if (matchesOperationEvent(event, operationRef.current, videoId)) {
-            applySnapshot(event);
+          if (
+            !disposed
+            && generation === generationRef.current
+            && matchesOperationEvent(event, operationRef.current, videoId)
+          ) {
+            applySnapshot(event, { generation, expectedVideo: videoId });
           }
         } catch {
           // Ignore malformed progress events and recover through status polling.
         }
       };
       socket.onclose = () => {
-        setSocketConnected(false);
-        if (!disposed) reconnectTimer = window.setTimeout(connect, 3000);
+        if (!disposed && generation === generationRef.current) {
+          setSocketConnected(false);
+          reconnectTimer = window.setTimeout(connect, 3000);
+        }
       };
     };
 
@@ -141,13 +184,19 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     if (!operation?.operation_id || !isUnfinishedTranscription(operation)) return undefined;
     const intervalMs = socketConnected ? 5000 : 3000;
     const timer = window.setInterval(() => {
-      refresh().catch((refreshError) => setError(refreshError.message));
+      refresh().catch((refreshError) => {
+        if (refreshError.name !== 'AbortError') setError(refreshError.message);
+      });
     }, intervalMs);
     return () => window.clearInterval(timer);
   }, [operation?.operation_id, operation?.status, socketConnected, refresh]);
 
   const start = useCallback(async () => {
     if (!videoId) return null;
+    const generation = generationRef.current;
+    const expectedVideo = videoId;
+    const controller = new AbortController();
+    requestControllersRef.current.add(controller);
     setError('');
     setPendingAction('start');
     try {
@@ -155,38 +204,53 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ video_id: videoId }),
+        signal: controller.signal,
       });
       const data = await readResponse(response);
-      if (data?.operation_id) applySnapshot(data);
+      if (generation !== generationRef.current || expectedVideo !== videoId) return null;
+      if (data?.operation_id) applySnapshot(data, {
+        claim: true,
+        generation,
+        expectedVideo,
+      });
       else onCompleted?.(data);
       return data;
     } catch (startError) {
-      setError(startError.message);
+      if (startError.name === 'AbortError') return null;
+      if (generation === generationRef.current) setError(startError.message);
       throw startError;
     } finally {
-      setPendingAction('');
+      requestControllersRef.current.delete(controller);
+      if (generation === generationRef.current) setPendingAction('');
     }
   }, [apiBase, videoId, applySnapshot, onCompleted]);
 
   const control = useCallback(async (action) => {
     const operationId = operationRef.current?.operation_id;
     if (!operationId) return null;
+    const generation = generationRef.current;
+    const expectedVideo = videoId;
+    const controller = new AbortController();
+    requestControllersRef.current.add(controller);
     setError('');
     setPendingAction(action);
     try {
       const response = await fetch(`${apiBase}/api/operations/${operationId}/${action}`, {
         method: 'POST',
+        signal: controller.signal,
       });
       const snapshot = await readResponse(response);
-      applySnapshot(snapshot);
+      applySnapshot(snapshot, { generation, expectedVideo });
       return snapshot;
     } catch (controlError) {
-      setError(controlError.message);
+      if (controlError.name === 'AbortError') return null;
+      if (generation === generationRef.current) setError(controlError.message);
       throw controlError;
     } finally {
-      setPendingAction('');
+      requestControllersRef.current.delete(controller);
+      if (generation === generationRef.current) setPendingAction('');
     }
-  }, [apiBase, applySnapshot]);
+  }, [apiBase, applySnapshot, videoId]);
 
   return {
     operation,

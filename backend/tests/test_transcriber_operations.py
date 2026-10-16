@@ -1,6 +1,5 @@
 import sys
 import threading
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,7 +64,14 @@ class TranscriberOperationTests(unittest.TestCase):
         first_partial = threading.Event()
         release_callback = threading.Event()
         partial_count = []
+        control_states = []
+        paused_ack = threading.Event()
         result_holder = {}
+
+        def on_control_state(state):
+            control_states.append(state)
+            if state == "paused":
+                paused_ack.set()
 
         def on_partial(snapshot):
             partial_count.append(len(snapshot["segments"]))
@@ -77,7 +83,10 @@ class TranscriberOperationTests(unittest.TestCase):
             target=lambda: result_holder.setdefault(
                 "result",
                 transcriber.transcribe(
-                    "video.mp4", control=control, on_partial=on_partial
+                    "video.mp4",
+                    control=control,
+                    on_partial=on_partial,
+                    on_control_state=on_control_state,
                 ),
             )
         )
@@ -86,7 +95,7 @@ class TranscriberOperationTests(unittest.TestCase):
         control.pause()
         release_callback.set()
 
-        time.sleep(0.05)
+        self.assertTrue(paused_ack.wait(timeout=1))
         self.assertTrue(worker.is_alive())
         self.assertEqual(partial_count, [1])
 
@@ -94,6 +103,7 @@ class TranscriberOperationTests(unittest.TestCase):
         worker.join(timeout=1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(partial_count, [1, 2])
+        self.assertEqual(control_states, ["paused", "running"])
         self.assertTrue(result_holder["result"]["is_complete"])
 
     def test_stop_returns_incomplete_result_with_checkpoint(self):
@@ -102,17 +112,22 @@ class TranscriberOperationTests(unittest.TestCase):
         )
         transcriber = ControlledTranscriber(model)
         control = OperationControl()
+        control_states = []
 
         def stop_after_first(_snapshot):
             control.request_stop()
 
         result = transcriber.transcribe(
-            "video.mp4", control=control, on_partial=stop_after_first
+            "video.mp4",
+            control=control,
+            on_partial=stop_after_first,
+            on_control_state=control_states.append,
         )
 
         self.assertFalse(result["is_complete"])
         self.assertEqual(result["checkpoint"], 2.0)
         self.assertEqual([item["text"] for item in result["segments"]], ["первый"])
+        self.assertEqual(control_states, ["stopped"])
 
     def test_resume_uses_one_second_overlap(self):
         model = FakeModel([fake_segment(10.2, 12.0, "продолжение")])
@@ -143,6 +158,67 @@ class TranscriberOperationTests(unittest.TestCase):
         merged = merge_transcript_segments(retained, resumed)
 
         self.assertEqual([item["text"] for item in merged], ["привет", "дальше"])
+
+    def test_overlap_merge_preserves_new_tail_of_straddling_segment(self):
+        retained = [
+            {
+                "start": 8.0,
+                "end": 10.0,
+                "text": "старая граница",
+                "words": [
+                    {"word": "старая", "start": 8.0, "end": 9.0},
+                    {"word": "граница", "start": 9.0, "end": 10.0},
+                ],
+            }
+        ]
+        resumed = [
+            {
+                "start": 9.0,
+                "end": 11.0,
+                "text": "граница новая",
+                "words": [
+                    {"word": "граница", "start": 9.0, "end": 10.0},
+                    {"word": "новая", "start": 10.0, "end": 11.0},
+                ],
+            }
+        ]
+
+        merged = merge_transcript_segments(retained, resumed)
+
+        words = [word["word"] for segment in merged for word in segment["words"]]
+        self.assertEqual(words, ["старая", "граница", "новая"])
+        self.assertEqual(merged[-1]["start"], 10.0)
+        self.assertEqual(merged[-1]["text"], "новая")
+
+    def test_overlap_merge_trims_small_overlap_without_duplicate_words(self):
+        retained = [
+            {
+                "start": 8.0,
+                "end": 10.0,
+                "text": "до границы",
+                "words": [
+                    {"word": "до", "start": 8.0, "end": 9.0},
+                    {"word": "границы", "start": 9.0, "end": 10.0},
+                ],
+            }
+        ]
+        resumed = [
+            {
+                "start": 9.5,
+                "end": 12.0,
+                "text": "границы после",
+                "words": [
+                    {"word": "границы", "start": 9.5, "end": 10.0},
+                    {"word": "после", "start": 10.0, "end": 12.0},
+                ],
+            }
+        ]
+
+        merged = merge_transcript_segments(retained, resumed)
+
+        words = [word["word"] for segment in merged for word in segment["words"]]
+        self.assertEqual(words, ["до", "границы", "после"])
+        self.assertEqual(len([word for word in words if word == "границы"]), 1)
 
     def test_partial_callback_receives_immutable_snapshots(self):
         model = FakeModel([fake_segment(0.0, 2.0, "оригинал")])

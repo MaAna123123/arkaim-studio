@@ -32,6 +32,7 @@ class TranscriptionService:
         self._publisher = publisher
         self._metadata: dict[str, dict] = {}
         self._futures: dict[str, asyncio.Future] = {}
+        self._video_operations: dict[tuple[str, str], str] = {}
         self._lock = threading.RLock()
 
     def start(
@@ -42,9 +43,25 @@ class TranscriptionService:
         transcript_path: Path,
         loop: asyncio.AbstractEventLoop,
     ) -> dict:
-        operation = self.manager.create("transcription", video_id)
-        operation_id = operation["operation_id"]
         with self._lock:
+            key = ("transcription", video_id)
+            known_id = self._video_operations.get(key)
+            if known_id:
+                known = self.manager.get(known_id)
+                reusable = known and known["status"] in {
+                    "queued", "running", "paused", "stopped"
+                }
+                completed_with_file = (
+                    known
+                    and known["status"] == "completed"
+                    and Path(transcript_path).exists()
+                )
+                if reusable or completed_with_file:
+                    return known
+
+            operation = self.manager.create("transcription", video_id)
+            operation_id = operation["operation_id"]
+            self._video_operations[key] = operation_id
             self._metadata.setdefault(
                 operation_id,
                 {
@@ -52,6 +69,7 @@ class TranscriptionService:
                     "language": language,
                     "transcript_path": Path(transcript_path),
                     "loop": loop,
+                    "generation": 1,
                 },
             )
             already_scheduled = operation_id in self._futures
@@ -67,7 +85,20 @@ class TranscriptionService:
         return operation
 
     def pause(self, operation_id: str) -> dict:
-        snapshot = self.manager.transition(operation_id, "paused")
+        with self._lock:
+            current = self.manager.get(operation_id)
+            if current is None:
+                raise KeyError(operation_id)
+            if current["status"] != "running" or current.get("pending_action"):
+                raise OperationConflictError(
+                    f"Cannot pause operation from {current['status']}"
+                )
+            self.manager.control(operation_id).pause()
+            snapshot = self.manager.update(
+                operation_id,
+                pending_action="pause",
+                message="Останавливаю Whisper на безопасной границе...",
+            )
         self._publish_for_operation(operation_id)
         return snapshot
 
@@ -76,29 +107,52 @@ class TranscriptionService:
         operation_id: str,
         loop: asyncio.AbstractEventLoop,
     ) -> dict:
-        current = self.manager.get(operation_id)
-        if current is None:
-            raise KeyError(operation_id)
-        if current["status"] == "paused":
-            snapshot = self.manager.transition(operation_id, "running")
-            self._publish_snapshot(operation_id, loop)
-            return snapshot
-        if current["status"] != "stopped":
-            raise OperationConflictError(
-                f"Cannot resume operation from {current['status']}"
-            )
-
-        snapshot = self.manager.transition(operation_id, "running")
         with self._lock:
+            current = self.manager.get(operation_id)
+            if current is None:
+                raise KeyError(operation_id)
+            if current["status"] == "paused":
+                if current.get("pending_action"):
+                    raise OperationConflictError("Operation already has a pending action")
+                self.manager.control(operation_id).resume()
+                snapshot = self.manager.update(
+                    operation_id,
+                    pending_action="resume",
+                    message="Возобновляю Whisper...",
+                )
+                self._publish_snapshot(operation_id, loop)
+                return snapshot
+            if current["status"] != "stopped":
+                raise OperationConflictError(
+                    f"Cannot resume operation from {current['status']}"
+                )
+
             if operation_id not in self._metadata:
                 raise OperationConflictError("Operation has no resumable worker metadata")
             self._metadata[operation_id]["loop"] = loop
-        self._schedule(operation_id, resume=True, loop=loop)
+            self._metadata[operation_id]["generation"] += 1
+            generation = self._metadata[operation_id]["generation"]
+            snapshot = self.manager.transition(operation_id, "running")
+            snapshot = self.manager.update(operation_id, pending_action=None)
+        self._schedule(operation_id, resume=True, loop=loop, generation=generation)
         self._publish_snapshot(operation_id, loop)
         return snapshot
 
     def stop(self, operation_id: str) -> dict:
-        snapshot = self.manager.transition(operation_id, "stopped")
+        with self._lock:
+            current = self.manager.get(operation_id)
+            if current is None:
+                raise KeyError(operation_id)
+            if current["status"] not in {"running", "paused"}:
+                raise OperationConflictError(
+                    f"Cannot stop operation from {current['status']}"
+                )
+            self.manager.control(operation_id).request_stop()
+            snapshot = self.manager.update(
+                operation_id,
+                pending_action="stop",
+                message="Останавливаю Whisper и сохраняю прогресс...",
+            )
         self._publish_for_operation(operation_id)
         return snapshot
 
@@ -107,30 +161,45 @@ class TranscriptionService:
         operation_id: str,
         resume: bool,
         loop: asyncio.AbstractEventLoop,
+        generation: int | None = None,
     ) -> None:
         with self._lock:
+            if generation is None:
+                generation = self._metadata[operation_id]["generation"]
             previous = self._futures.get(operation_id)
             if previous is not None and not previous.done():
                 previous.add_done_callback(
                     lambda _future: loop.call_soon_threadsafe(
-                        self._launch, operation_id, resume, loop
+                        self._launch, operation_id, resume, loop, generation
                     )
                 )
                 return
-        self._launch(operation_id, resume, loop)
+        self._launch(operation_id, resume, loop, generation)
 
     def _launch(
         self,
         operation_id: str,
         resume: bool,
         loop: asyncio.AbstractEventLoop,
+        generation: int,
     ) -> None:
+        with self._lock:
+            metadata = self._metadata.get(operation_id)
+            current = self.manager.get(operation_id)
+            if (
+                metadata is None
+                or metadata["generation"] != generation
+                or current is None
+                or current["status"] not in {"queued", "running"}
+            ):
+                return
         future = loop.run_in_executor(
             None,
             self._run_worker,
             operation_id,
             resume,
             loop,
+            generation,
         )
         with self._lock:
             self._futures[operation_id] = future
@@ -147,12 +216,15 @@ class TranscriptionService:
         operation_id: str,
         resume: bool,
         loop: asyncio.AbstractEventLoop,
+        generation: int,
     ) -> None:
         with self._lock:
+            if self._metadata[operation_id]["generation"] != generation:
+                return
             metadata = dict(self._metadata[operation_id])
 
         current = self.manager.get(operation_id)
-        if current is None or current["status"] == "stopped":
+        if current is None or current["status"] not in {"queued", "running"}:
             return
         if current["status"] == "queued":
             self.manager.transition(operation_id, "running")
@@ -163,6 +235,8 @@ class TranscriptionService:
         started_at = time.monotonic()
 
         def on_progress(message: str, progress_pct: int) -> None:
+            if not self._is_current_generation(operation_id, generation):
+                return
             pct = max(0, min(int(progress_pct), 100))
             elapsed = max(0.0, time.monotonic() - started_at)
             eta = None
@@ -177,10 +251,30 @@ class TranscriptionService:
             self._publish_snapshot(operation_id, loop)
 
         def on_partial(partial: dict) -> None:
+            if not self._is_current_generation(operation_id, generation):
+                return
             self.manager.update(
                 operation_id,
                 partial_result=copy.deepcopy(partial),
             )
+            self._publish_snapshot(operation_id, loop)
+
+        def on_control_state(state: str) -> None:
+            with self._lock:
+                if not self._is_current_generation(operation_id, generation):
+                    return
+                latest = self.manager.get(operation_id)
+                if latest is None:
+                    return
+                if state == "paused" and latest["status"] == "running":
+                    self.manager.transition(operation_id, "paused")
+                elif state == "running" and latest["status"] == "paused":
+                    self.manager.transition(operation_id, "running")
+                elif state == "stopped" and latest["status"] in {"running", "paused"}:
+                    self.manager.transition(operation_id, "stopped")
+                else:
+                    return
+                self.manager.update(operation_id, pending_action=None)
             self._publish_snapshot(operation_id, loop)
 
         try:
@@ -190,44 +284,95 @@ class TranscriptionService:
                 on_progress,
                 control=control,
                 on_partial=on_partial,
+                on_control_state=on_control_state,
                 resume_from=checkpoint,
                 retained_result=retained,
             )
+            if not self._is_current_generation(operation_id, generation):
+                return
             self.manager.update(operation_id, partial_result=copy.deepcopy(result))
 
             latest = self.manager.get(operation_id)
-            if not result.get("is_complete") or latest["status"] == "stopped":
+            if result.get("is_complete") and latest.get("pending_action") == "stop":
+                on_control_state("stopped")
+                self._publish_snapshot(operation_id, loop)
+                return
+            if result.get("is_complete") and latest.get("pending_action") == "pause":
+                # The final segment won the race with the pause boundary. Finishing
+                # is safer than leaving a paused operation without a live worker.
+                self.manager.update(operation_id, pending_action=None)
+                latest = self.manager.get(operation_id)
+            if not result.get("is_complete") or latest["status"] != "running":
                 self._publish_snapshot(operation_id, loop)
                 return
 
             final_result = copy.deepcopy(result)
             final_result.pop("is_complete", None)
             final_result.pop("checkpoint", None)
-            self._write_final_transcript(
-                metadata["transcript_path"], operation_id, final_result
-            )
-            self.manager.update(
-                operation_id,
-                partial_result=final_result,
-                progress_pct=100,
-                message="Транскрипция завершена!",
-                eta_seconds=0,
-            )
-            self.manager.transition(operation_id, "completed")
+            with self._lock:
+                latest = self.manager.get(operation_id)
+                if (
+                    not self._is_current_generation(operation_id, generation)
+                    or latest is None
+                    or latest["status"] != "running"
+                    or latest.get("pending_action")
+                ):
+                    return
+                self._write_final_transcript(
+                    metadata["transcript_path"], operation_id, final_result
+                )
+                self.manager.update(
+                    operation_id,
+                    partial_result=final_result,
+                    progress_pct=100,
+                    message="Транскрипция завершена!",
+                    eta_seconds=0,
+                    pending_action=None,
+                )
+                self.manager.transition(operation_id, "completed")
             self._publish_snapshot(operation_id, loop)
         except Exception as exc:
             logger.exception("Transcription worker failed")
             safe_error = f"Ошибка транскрипции: {str(exc)[:500]}"
-            self.manager.update(
-                operation_id,
-                error=safe_error,
-                message="Транскрипция завершилась с ошибкой",
-                eta_seconds=None,
-            )
-            latest = self.manager.get(operation_id)
-            if latest and latest["status"] in {"queued", "running", "paused"}:
-                self.manager.transition(operation_id, "failed")
-            self._publish_snapshot(operation_id, loop)
+            if self._is_current_generation(operation_id, generation):
+                self.manager.update(
+                    operation_id,
+                    error=safe_error,
+                    message="Транскрипция завершилась с ошибкой",
+                    eta_seconds=None,
+                    pending_action=None,
+                )
+                latest = self.manager.get(operation_id)
+                if latest and latest["status"] in {"queued", "running", "paused"}:
+                    self.manager.transition(operation_id, "failed")
+                self._publish_snapshot(operation_id, loop)
+
+    def _is_current_generation(self, operation_id: str, generation: int) -> bool:
+        with self._lock:
+            metadata = self._metadata.get(operation_id)
+            return metadata is not None and metadata["generation"] == generation
+
+    async def wait_for_terminal(self, operation_id: str) -> dict:
+        while True:
+            snapshot = self.manager.get(operation_id)
+            if snapshot is None:
+                raise KeyError(operation_id)
+            if snapshot["status"] in {"completed", "failed", "stopped", "cancelled"}:
+                return snapshot
+            await asyncio.sleep(0.05)
+
+    async def shutdown(self, timeout: float = 2.0) -> None:
+        with self._lock:
+            for operation in self.manager.list_operations(active_only=True):
+                operation_id = operation["operation_id"]
+                if operation["status"] in {"running", "paused"}:
+                    self.manager.control(operation_id).request_stop()
+                    self.manager.update(operation_id, pending_action="stop")
+                elif operation["status"] == "queued":
+                    self.manager.transition(operation_id, "cancelled")
+            futures = [future for future in self._futures.values() if not future.done()]
+        if futures:
+            await asyncio.wait(futures, timeout=timeout)
 
     @staticmethod
     def _write_final_transcript(

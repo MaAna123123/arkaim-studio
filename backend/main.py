@@ -143,6 +143,11 @@ transcription_service = TranscriptionService(
     broadcast,
 )
 
+
+@app.on_event("shutdown")
+async def shutdown_transcription_workers():
+    await transcription_service.shutdown()
+
 @app.websocket("/ws/progress")
 async def ws_progress(websocket: WebSocket):
     await websocket.accept()
@@ -761,6 +766,9 @@ async def transcribe_video(req: TranscribeRequest):
         transcript_file,
         asyncio.get_running_loop(),
     )
+    if operation["status"] == "completed" and transcript_file.exists():
+        with open(transcript_file, "r", encoding="utf-8") as f:
+            return json.load(f)
     return JSONResponse(
         content=operation,
         status_code=200 if existing is not None else 202,
@@ -889,22 +897,24 @@ async def analyze_video(req: AnalyzeRequest):
         transcript_file = TRANSCRIPTS_DIR / f"{req.video_id}.json"
         if not transcript_file.exists():
             await broadcast({"type": "progress", "step": "transcribing", "pct": 5, "msg": "Создаю транскрипт (Whisper)..."})
-
-            loop = asyncio.get_running_loop()
-            def sync_progress(msg: str, pct: int):
-                asyncio.run_coroutine_threadsafe(
-                    broadcast({"type": "progress", "step": "transcribing", "pct": pct, "msg": msg}),
-                    loop
-                )
-
-            transcript_data = await asyncio.to_thread(
-                transcriber.transcribe, str(video_path), None, sync_progress
+            operation = transcription_service.start(
+                req.video_id,
+                str(video_path),
+                None,
+                transcript_file,
+                asyncio.get_running_loop(),
             )
-            with open(transcript_file, "w", encoding="utf-8") as f:
-                json.dump(transcript_data, f, ensure_ascii=False)
-        else:
-            with open(transcript_file, "r", encoding="utf-8") as f:
-                transcript_data = json.load(f)
+            operation = await transcription_service.wait_for_terminal(
+                operation["operation_id"]
+            )
+            if operation["status"] != "completed" or not transcript_file.exists():
+                detail = operation.get("error") or (
+                    "Whisper был остановлен до завершения. Продолжите транскрипцию."
+                )
+                raise HTTPException(status_code=409, detail=detail)
+
+        with open(transcript_file, "r", encoding="utf-8") as f:
+            transcript_data = json.load(f)
 
         prompt = req.prompt.strip() or _DEFAULT_ANALYZE_PROMPT
         chapters_file = TRANSCRIPTS_DIR / f"{req.video_id}.chapters.json"

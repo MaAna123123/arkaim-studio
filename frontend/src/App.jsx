@@ -22,21 +22,21 @@ const SESSION_KEY = 'videopril.session.v1';
 function loadStoredSession() {
   try {
     if (typeof window !== 'undefined' && window.location.search.includes('reset=1')) {
-      localStorage.removeItem(SESSION_KEY);
+      sessionStorage.removeItem(SESSION_KEY);
       window.history.replaceState({}, document.title, window.location.pathname);
       return {};
     }
-    const raw = localStorage.getItem(SESSION_KEY);
+    const raw = sessionStorage.getItem(SESSION_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     if (typeof parsed !== 'object' || parsed === null) return {};
     if (parsed.video && typeof parsed.video !== 'object') {
-      localStorage.removeItem(SESSION_KEY);
+      sessionStorage.removeItem(SESSION_KEY);
       return {};
     }
     return parsed;
   } catch {
-    try { localStorage.removeItem(SESSION_KEY); } catch {}
+    try { sessionStorage.removeItem(SESSION_KEY); } catch {}
     return {};
   }
 }
@@ -116,15 +116,19 @@ export default function App() {
   const wsRef = useRef(null);
   const subtitleInputRef = useRef(null);
   const afterChapterImportRef = useRef(false);
+  const selectedVideoIdRef = useRef(video?.video_id);
+  selectedVideoIdRef.current = video?.video_id;
 
   const handleTranscriptionCompleted = useCallback(async (directTranscript = null) => {
     if (!video?.video_id) return;
+    const requestedVideoId = video.video_id;
     try {
       const data = directTranscript?.full_text && !directTranscript?.operation_id
         ? directTranscript
         : await readApiResponse(
-          await fetch(`${API}/api/video/transcript/${video.video_id}`),
+          await fetch(`${API}/api/video/transcript/${requestedVideoId}`),
         );
+      if (selectedVideoIdRef.current !== requestedVideoId) return;
       if (!data?.full_text && !data?.has_transcript) return;
       setTranscript({ ...data, has_transcript: true });
       setSubtitleNotice(
@@ -155,12 +159,12 @@ export default function App() {
 
   useEffect(() => {
     if (!video) {
-      localStorage.removeItem(SESSION_KEY);
+      sessionStorage.removeItem(SESSION_KEY);
       return;
     }
 
     try {
-      localStorage.setItem(SESSION_KEY, JSON.stringify({
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({
         video,
         subtitleContext,
         subtitleNotice,
@@ -320,7 +324,7 @@ export default function App() {
     setSubtitleContext(null);
     setSubtitleNotice('');
     try {
-      localStorage.removeItem(SESSION_KEY);
+      sessionStorage.removeItem(SESSION_KEY);
     } catch {}
   };
 
@@ -721,7 +725,7 @@ export default function App() {
         <OperationPanel
           operation={transcriptionOperation}
           error={operationError}
-          pendingAction={operationPendingAction}
+          pendingAction={operationPendingAction || transcriptionOperation?.pending_action}
           onPause={pauseTranscription}
           onResume={resumeTranscription}
           onStop={stopTranscription}
