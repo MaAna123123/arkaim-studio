@@ -15,30 +15,17 @@ import AdManager from './components/AdManager';
 import SocialSharePanel from './components/SocialSharePanel';
 import OperationPanel from './components/OperationPanel';
 import useOperation, { isUnfinishedTranscription } from './hooks/useOperation';
+import { clearSession, loadSession, saveSession } from './lib/sessionStorage';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 const SESSION_KEY = 'videopril.session.v1';
-
 function loadStoredSession() {
-  try {
-    if (typeof window !== 'undefined' && window.location.search.includes('reset=1')) {
-      sessionStorage.removeItem(SESSION_KEY);
-      window.history.replaceState({}, document.title, window.location.pathname);
-      return {};
-    }
-    const raw = sessionStorage.getItem(SESSION_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return {};
-    if (parsed.video && typeof parsed.video !== 'object') {
-      sessionStorage.removeItem(SESSION_KEY);
-      return {};
-    }
-    return parsed;
-  } catch {
-    try { sessionStorage.removeItem(SESSION_KEY); } catch {}
+  if (typeof window !== 'undefined' && window.location.search.includes('reset=1')) {
+    clearSession(window.sessionStorage);
+    window.history.replaceState({}, document.title, window.location.pathname);
     return {};
   }
+  return loadSession(window.sessionStorage);
 }
 
 function apiUrl(path) {
@@ -323,9 +310,7 @@ export default function App() {
     setTranscript(null);
     setSubtitleContext(null);
     setSubtitleNotice('');
-    try {
-      sessionStorage.removeItem(SESSION_KEY);
-    } catch {}
+    clearSession(window.sessionStorage);
   };
 
   // ── Transcribe (Whisper) ───────────────────────────────────────────────────
