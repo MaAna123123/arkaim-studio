@@ -27,6 +27,16 @@ try:
     from .social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
     from .operation_manager import OperationConflictError, OperationManager
     from .transcription_service import TranscriptionService
+    from .schemas import (
+        AnalyzeRequest, AutoPipelineRequest, ExportRequest, SettingsRequest,
+        SocialPrepareRequest, SocialUploadRequest, TranscribeRequest, YoutubeUrlRequest,
+    )
+    from .transcript_utils import (
+        attach_transcript_text as _attach_transcript_text,
+        extract_words_from_json as _extract_words_from_json,
+        snap_segments_to_speech,
+        transcript_summary as _transcript_summary,
+    )
 except ImportError:
     from video_processor import VideoProcessor
     from ai_analyzer import VideoAIAnalyzer, generate_equal_chunks
@@ -36,6 +46,16 @@ except ImportError:
     from social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
     from operation_manager import OperationConflictError, OperationManager
     from transcription_service import TranscriptionService
+    from schemas import (
+        AnalyzeRequest, AutoPipelineRequest, ExportRequest, SettingsRequest,
+        SocialPrepareRequest, SocialUploadRequest, TranscribeRequest, YoutubeUrlRequest,
+    )
+    from transcript_utils import (
+        attach_transcript_text as _attach_transcript_text,
+        extract_words_from_json as _extract_words_from_json,
+        snap_segments_to_speech,
+        transcript_summary as _transcript_summary,
+    )
 
 # ─────────────────────────────────────────────
 # Force ALL temp files & model caches to Drive X:
@@ -162,77 +182,6 @@ async def ws_progress(websocket: WebSocket):
             active_connections.remove(websocket)
 
 # ─────────────────────────────────────────────
-# Pydantic models
-# ─────────────────────────────────────────────
-class AnalyzeRequest(BaseModel):
-    video_id: str
-    prompt: str = ""
-    mode: str = "transcript"  # "transcript" | "frames" | "equal_chunks"
-    chunk_minutes: float = 4.0
-
-class ExportRequest(BaseModel):
-    video_id: str
-    segments: list[dict]
-    mode: str = "separate"   # "separate" | "concat"
-    padding: float = 0.5
-    aspect_ratio: str = "original"  # "original" | "9:16"
-    burn_subtitles: bool = True
-    insert_ad: bool = False
-    text_ad_enabled: bool = False
-    text_ad_text: str = ""
-    text_ad_position: str = "top"
-    text_ad_interval: float = 4.0
-    text_ad_opacity: float = 0.75
-    video_banner_enabled: bool = False
-    video_banner_height: int = 380
-
-class SocialUploadRequest(BaseModel):
-    platform: str  # "youtube" | "instagram" | "tiktok"
-    clip_url: str
-    title: str = "Untitled"
-    description: str = ""
-    tags: list[str] = []
-    privacy: str = "private"
-
-class SettingsRequest(BaseModel):
-    provider: Optional[str] = "gemini"
-    api_key: Optional[str] = ""
-    model_name: Optional[str] = ""
-    base_url: Optional[str] = ""
-    gemini_api_key: Optional[str] = ""
-    whisper_model: Optional[str] = ""
-
-class YoutubeUrlRequest(BaseModel):
-    url: str
-    quality: str = "720"
-
-class AutoPipelineRequest(BaseModel):
-    """Один запрос: ссылка → готовые клипы."""
-    url: str
-    quality: str = "720"
-    prompt: str = ""
-    aspect_ratio: str = "9:16"
-    burn_subtitles: bool = True
-    padding: float = 0.4
-    max_clips: int = 10
-    insert_ad: bool = False
-    text_ad_enabled: bool = False
-    text_ad_text: str = ""
-    text_ad_position: str = "top"
-    text_ad_interval: float = 4.0
-    text_ad_opacity: float = 0.75
-
-class SocialPrepareRequest(BaseModel):
-    platform: str
-    clip_url: str
-    label: str = ""
-    transcript_text: str = ""
-
-class TranscribeRequest(BaseModel):
-    video_id: str
-    language: Optional[str] = None
-
-# ─────────────────────────────────────────────
 # Health & Settings
 # ─────────────────────────────────────────────
 @app.get("/api/health")
@@ -327,7 +276,7 @@ _DEFAULT_ANALYZE_PROMPT = (
 _SENTENCE_END_CHARS = (".", "!", "?", "…")
 
 
-def snap_segments_to_speech(
+def _legacy_snap_segments_to_speech(
     segments: list[dict],
     transcript: dict,
     duration: float = 0,
@@ -414,7 +363,7 @@ def snap_segments_to_speech(
     return deduped
 
 
-def _attach_transcript_text(segments: list[dict], words: list[dict]) -> None:
+def _legacy_attach_transcript_text(segments: list[dict], words: list[dict]) -> None:
     """Прикрепляет к каждому фрагменту его текст — нужен для подписей и хэштегов."""
     if not words:
         return
@@ -435,7 +384,7 @@ def _attach_transcript_text(segments: list[dict], words: list[dict]) -> None:
 # ─────────────────────────────────────────────
 # YouTube endpoints
 # ─────────────────────────────────────────────
-def _transcript_summary(transcript: dict) -> dict:
+def _legacy_transcript_summary(transcript: dict) -> dict:
     """Краткая сводка вместо полного транскрипта — он может весить мегабайты."""
     return {
         "has_transcript": bool(transcript.get("has_transcript")),
@@ -948,7 +897,7 @@ async def analyze_video(req: AnalyzeRequest):
 # ─────────────────────────────────────────────
 # Export
 # ─────────────────────────────────────────────
-def _extract_words_from_json(t_data: dict) -> list[dict]:
+def _legacy_extract_words_from_json(t_data: dict) -> list[dict]:
     """Extract flat word list from transcript JSON (supports both formats)."""
     if not t_data:
         return []
