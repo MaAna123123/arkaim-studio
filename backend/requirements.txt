@@ -9,6 +9,8 @@ numpy==2.2.0
 ffmpeg-python==0.2.0
 aiofiles==24.1.0
 faster-whisper==1.1.0
+# faster-whisper 1.1.x passes metadata_errors to PyAV; PyAV 19 removed it.
+av<19
 
 # YouTube регулярно меняет способ отдачи видео и субтитров, и старая версия
 # yt-dlp просто перестаёт извлекать данные. Версию не фиксируем — обновляйте
