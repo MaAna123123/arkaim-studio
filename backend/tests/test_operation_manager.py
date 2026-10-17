@@ -15,6 +15,7 @@ from operation_manager import OperationConflictError, OperationManager  # noqa: 
 class OperationManagerTests(unittest.TestCase):
     def restored_snapshot(self, **overrides):
         snapshot = {
+            "schema_version": 1,
             "operation_id": "a3e55f84-538c-4db7-bc61-5607953fa9a2",
             "operation_type": "transcription",
             "video_id": "02afe1b0-c9e0-4746-861f-b06006bd6af0",
@@ -40,6 +41,24 @@ class OperationManagerTests(unittest.TestCase):
         }
         snapshot.update(overrides)
         return snapshot
+
+    def test_restore_accepts_schema_version_one_persisted_checkpoint(self):
+        manager = OperationManager()
+        checkpoint = self.restored_snapshot(language=None)
+
+        restored = manager.restore(checkpoint)
+
+        self.assertEqual(restored["schema_version"], 1)
+        self.assertEqual(restored["operation_id"], checkpoint["operation_id"])
+
+    def test_restore_rejects_unsupported_schema_version_without_mutation(self):
+        manager = OperationManager()
+        checkpoint = self.restored_snapshot(schema_version=2)
+
+        with self.assertRaises(ValueError):
+            manager.restore(checkpoint)
+
+        self.assertIsNone(manager.get(checkpoint["operation_id"]))
 
     def test_restore_preserves_snapshot_data_with_fresh_control_and_no_work_started(self):
         manager = OperationManager()

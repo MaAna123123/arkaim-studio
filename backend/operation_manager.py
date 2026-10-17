@@ -13,6 +13,7 @@ RESUMABLE_STATUSES = ACTIVE_STATUSES | {"stopped"}
 TERMINAL_STATUSES = {"stopped", "completed", "failed", "cancelled"}
 RESTORABLE_STATUSES = RESUMABLE_STATUSES | {"failed", "completed", "cancelled"}
 RECOVERY_MESSAGE = "Прервано после закрытия приложения — можно продолжить"
+CHECKPOINT_SCHEMA_VERSION = 1
 
 
 class OperationConflictError(RuntimeError):
@@ -52,6 +53,7 @@ class OperationControl:
 
 class OperationManager:
     _RESTORE_FIELDS = {
+        "schema_version",
         "operation_id",
         "operation_type",
         "video_id",
@@ -98,6 +100,7 @@ class OperationManager:
             now = self._now()
             operation_id = str(uuid.uuid4())
             record = {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
                 "operation_id": operation_id,
                 "operation_type": operation_type,
                 "video_id": video_id,
@@ -256,6 +259,11 @@ class OperationManager:
 
         if snapshot["operation_type"] != "transcription":
             raise ValueError("Unsupported operation type")
+        if (
+            type(snapshot["schema_version"]) is not int
+            or snapshot["schema_version"] != CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError("Unsupported operation schema version")
         status = snapshot["status"]
         if status not in RESTORABLE_STATUSES:
             raise ValueError("Unsupported operation status")
