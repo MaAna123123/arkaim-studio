@@ -14,6 +14,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from operation_manager import OperationConflictError, OperationManager  # noqa: E402
+from project_store import ProjectStore  # noqa: E402
 from transcription_service import TranscriptionService  # noqa: E402
 
 
@@ -310,6 +311,66 @@ class TranscriptionRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.service._video_operations[("transcription", last_project_id)],
             last_operation_id,
         )
+
+    def test_recovery_rejects_cross_project_checkpoint_without_mutation(self):
+        other_project_id = "c4548a12-1ac7-4a30-95d7-36460a4eb456"
+        self.store.checkpoints[self.project_id]["video_id"] = other_project_id
+        original_project = copy.deepcopy(self.store.projects[self.project_id])
+        original_checkpoint = copy.deepcopy(self.store.checkpoints[self.project_id])
+
+        recovered = self.service.recover_projects()
+
+        self.assertEqual(recovered, [])
+        self.assertIsNone(self.manager.get(self.operation_id))
+        self.assertEqual(self.service._metadata, {})
+        self.assertEqual(self.service._video_operations, {})
+        self.assertEqual(self.store.projects[self.project_id], original_project)
+        self.assertEqual(self.store.checkpoints[self.project_id], original_checkpoint)
+        self.assertNotIn(
+            "save_checkpoint", [call[0] for call in self.store.calls]
+        )
+        self.assertNotIn(
+            "remove_checkpoint", [call[0] for call in self.store.calls]
+        )
+
+    def test_malformed_final_transcript_does_not_hide_valid_checkpoint(self):
+        real_root = Path(self.temp_dir.name) / "real-store"
+        source_path = real_root / "backend" / "uploads" / "lesson.mp4"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"video")
+        store = ProjectStore(real_root)
+        store.create_project(
+            video_id=self.project_id,
+            title="Lesson",
+            source_filename="lesson.mp4",
+            source_path=source_path,
+            video={},
+        )
+        checkpoint = saved_checkpoint(self.project_id, self.operation_id)
+        store.save_checkpoint(self.project_id, checkpoint)
+        transcript_path = (
+            store.projects_root / self.project_id / "transcript.json"
+        )
+        malformed = '{"full_text": '
+        transcript_path.write_text(malformed, encoding="utf-8")
+        manager = TrackingOperationManager()
+        transcriber = NeverStartTranscriber()
+
+        async def publish(_event):
+            return None
+
+        service = TranscriptionService(manager, transcriber, publish, store)
+
+        with self.assertLogs("transcription_service", level="ERROR"):
+            recovered = service.recover_projects()
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(manager.get(self.operation_id)["status"], "stopped")
+        self.assertEqual(store.load_checkpoint(self.project_id), checkpoint)
+        self.assertEqual(
+            transcript_path.read_text(encoding="utf-8"), malformed
+        )
+        self.assertEqual(transcriber.calls, [])
 
 
 if __name__ == "__main__":

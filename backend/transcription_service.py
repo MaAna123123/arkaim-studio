@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -120,12 +121,23 @@ class TranscriptionService:
             if not project_id:
                 continue
             try:
-                if self.project_store.load_transcript(project_id) is not None:
-                    continue
                 checkpoint = self.project_store.load_checkpoint(project_id)
                 if checkpoint is None:
                     continue
-                project = self.project_store.get_project(project_id)
+                project = self._load_recovery_project_record(project_id)
+                project_id = self._validated_recovery_identity(
+                    project_id, project, checkpoint
+                )
+                try:
+                    final_transcript = self.project_store.load_transcript(project_id)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    logger.exception(
+                        "Invalid final transcript for project %s; recovering checkpoint",
+                        project_id,
+                    )
+                    final_transcript = None
+                if final_transcript is not None:
+                    continue
                 source_path = Path(project["source_path"])
                 if not source_path.is_absolute():
                     source_path = Path(self.project_store.project_root) / source_path
@@ -160,6 +172,48 @@ class TranscriptionService:
                 ]
             recovered.append(restored)
         return recovered
+
+    def _load_recovery_project_record(self, project_id: str) -> dict:
+        """Load validated project metadata without opening the final transcript."""
+        store = self.project_store
+        project_file = Path(store.projects_root) / project_id / "project.json"
+        read_json = getattr(store, "_read_json", None)
+        validate_schema = getattr(store, "_validate_project_schema", None)
+        project_lock = getattr(store, "_project_lock", None)
+        normalize_source = getattr(store, "_relative_source_path", None)
+        if not all(callable(method) for method in (read_json, validate_schema)):
+            return store.get_project(project_id)
+
+        if callable(project_lock):
+            with project_lock(project_id):
+                project = read_json(project_file)
+                validate_schema(project, project_id)
+        else:
+            project = read_json(project_file)
+            validate_schema(project, project_id)
+        if callable(normalize_source):
+            project["source_path"] = normalize_source(project.get("source_path"))
+        return project
+
+    @staticmethod
+    def _validated_recovery_identity(
+        scanned_project_id: str,
+        project: dict,
+        checkpoint: dict,
+    ) -> str:
+        identities = (
+            scanned_project_id,
+            project.get("project_id"),
+            project.get("video_id"),
+            checkpoint.get("video_id"),
+        )
+        try:
+            normalized = [str(uuid.UUID(str(identity))) for identity in identities]
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Invalid recovery project identity") from exc
+        if len(set(normalized)) != 1:
+            raise ValueError("Recovery project identities do not match")
+        return normalized[0]
 
     def pause(self, operation_id: str) -> dict:
         with self._operation_action_lock(operation_id):
@@ -383,11 +437,16 @@ class TranscriptionService:
                 resume_from=checkpoint,
                 retained_result=retained,
             )
-            if not self._is_current_generation(operation_id, generation):
-                return
-            self.manager.update(operation_id, partial_result=copy.deepcopy(result))
-
-            latest = self.manager.get(operation_id)
+            with self._operation_action_lock(operation_id):
+                with self._lock:
+                    if not self._is_current_generation(operation_id, generation):
+                        return
+                    self.manager.update(
+                        operation_id, partial_result=copy.deepcopy(result)
+                    )
+                    latest = self.manager.get(operation_id)
+                if not result.get("is_complete") and latest["status"] == "stopped":
+                    self._persist_checkpoint(operation_id)
             if result.get("is_complete") and latest.get("pending_action") == "stop":
                 on_control_state("stopped")
                 self._publish_snapshot(operation_id, loop)

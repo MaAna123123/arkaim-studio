@@ -146,6 +146,95 @@ class ControllableTranscriber:
         return partial_result("готовый текст", 4.0, complete=True)
 
 
+class StopReturnTranscriber:
+    def __init__(self, emit_partial=False):
+        self.emit_partial = emit_partial
+        self.started = threading.Event()
+        self.partial_emitted = threading.Event()
+        self.returned_result = partial_result("возврат на границе", 3.5)
+
+    def transcribe(
+        self,
+        _video_path,
+        language=None,
+        on_progress=None,
+        control=None,
+        on_partial=None,
+        on_control_state=None,
+        resume_from=0.0,
+        retained_result=None,
+    ):
+        self.started.set()
+        if self.emit_partial and on_partial:
+            on_partial(partial_result("старая часть", 1.0))
+            self.partial_emitted.set()
+        while not control.stop_requested:
+            time.sleep(0.005)
+        if on_control_state:
+            on_control_state("stopped")
+        return copy.deepcopy(self.returned_result)
+
+
+class GenerationRaceTranscriber:
+    def __init__(self, arm_validation):
+        self.arm_validation = arm_validation
+        self.first_started = threading.Event()
+        self.second_started = threading.Event()
+        self.persisted_result = partial_result("сохранённая часть", 1.0)
+        self.retiring_result = partial_result("возврат старого воркера", 2.5)
+        self.second_retained = None
+        self._call_count = 0
+        self._lock = threading.Lock()
+
+    def transcribe(
+        self,
+        _video_path,
+        language=None,
+        on_progress=None,
+        control=None,
+        on_partial=None,
+        on_control_state=None,
+        resume_from=0.0,
+        retained_result=None,
+    ):
+        with self._lock:
+            self._call_count += 1
+            call_number = self._call_count
+        if call_number == 1:
+            if on_partial:
+                on_partial(copy.deepcopy(self.persisted_result))
+            self.first_started.set()
+            while not control.stop_requested:
+                time.sleep(0.005)
+            if on_control_state:
+                on_control_state("stopped")
+            self.arm_validation.set()
+            return copy.deepcopy(self.retiring_result)
+
+        self.second_retained = copy.deepcopy(retained_result)
+        self.second_started.set()
+        return copy.deepcopy(retained_result)
+
+
+class ValidationInterleavingService(TranscriptionService):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.arm_validation = threading.Event()
+        self.validation_observed = threading.Event()
+        self.allow_result_update = threading.Event()
+
+    def _is_current_generation(self, operation_id, generation):
+        is_current = super()._is_current_generation(operation_id, generation)
+        if (
+            is_current
+            and self.arm_validation.is_set()
+            and not self.validation_observed.is_set()
+        ):
+            self.validation_observed.set()
+            self.allow_result_update.wait(1.0)
+        return is_current
+
+
 class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         (PROJECT_ROOT / "temp").mkdir(exist_ok=True)
@@ -277,6 +366,75 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.transcript_path.exists())
         persisted = await self.wait_for_persisted_status("stopped")
         self.assertEqual(persisted["partial_result"], snapshot["partial_result"])
+
+    async def test_stop_persists_returned_snapshot_without_prior_partial(self):
+        transcriber = StopReturnTranscriber()
+        service = self.make_service(transcriber)
+        operation = service.start(
+            "video-1",
+            "video.mp4",
+            None,
+            self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        await self.assert_event_set(transcriber.started)
+
+        service.stop(operation["operation_id"])
+        await self.wait_for_status(service, operation["operation_id"], "stopped")
+        await service.shutdown(timeout=0.5)
+
+        self.assertEqual(
+            self.store.checkpoints["video-1"]["partial_result"],
+            transcriber.returned_result,
+        )
+
+    async def test_graceful_shutdown_persists_returned_snapshot_newer_than_partial(self):
+        transcriber = StopReturnTranscriber(emit_partial=True)
+        service = self.make_service(transcriber)
+        operation = service.start(
+            "video-1",
+            "video.mp4",
+            None,
+            self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        await self.assert_event_set(transcriber.partial_emitted)
+
+        await service.shutdown(timeout=0.5)
+
+        persisted = self.store.checkpoints["video-1"]
+        self.assertEqual(persisted["status"], "stopped")
+        self.assertEqual(persisted["partial_result"], transcriber.returned_result)
+        self.assertEqual(
+            service.manager.get(operation["operation_id"])["partial_result"],
+            transcriber.returned_result,
+        )
+
+    async def test_retiring_worker_cannot_replace_retained_state_after_resume(self):
+        service = ValidationInterleavingService(
+            OperationManager(), None, self.publish, self.store
+        )
+        transcriber = GenerationRaceTranscriber(service.arm_validation)
+        service.transcriber = transcriber
+        loop = asyncio.get_running_loop()
+        operation = service.start(
+            "video-1", "video.mp4", None, self.transcript_path, loop
+        )
+        await self.assert_event_set(transcriber.first_started)
+        service.stop(operation["operation_id"])
+        await self.assert_event_set(service.validation_observed)
+
+        resume_task = asyncio.create_task(
+            asyncio.to_thread(service.resume, operation["operation_id"], loop)
+        )
+        await asyncio.sleep(0.03)
+        service.allow_result_update.set()
+        await resume_task
+        await self.assert_event_set(transcriber.second_started)
+
+        durable = self.store.checkpoints["video-1"]["partial_result"]
+        self.assertEqual(durable, transcriber.retiring_result)
+        self.assertEqual(transcriber.second_retained, durable)
 
     async def test_resume_stopped_operation_reuses_partial_result(self):
         transcriber = ControllableTranscriber()
