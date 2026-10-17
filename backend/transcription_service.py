@@ -13,8 +13,10 @@ from typing import Awaitable, Callable
 
 try:
     from .operation_manager import OperationConflictError, OperationManager
+    from .project_store import ProjectStore
 except ImportError:
     from operation_manager import OperationConflictError, OperationManager
+    from project_store import ProjectStore
 
 
 logger = logging.getLogger(__name__)
@@ -26,13 +28,16 @@ class TranscriptionService:
         manager: OperationManager,
         transcriber,
         publisher: Callable[[dict], Awaitable[None]],
+        project_store: ProjectStore | None = None,
     ) -> None:
         self.manager = manager
         self.transcriber = transcriber
         self._publisher = publisher
+        self.project_store = project_store
         self._metadata: dict[str, dict] = {}
         self._futures: dict[str, asyncio.Future] = {}
         self._video_operations: dict[tuple[str, str], str] = {}
+        self._action_locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
 
     def start(
@@ -79,26 +84,99 @@ class TranscriptionService:
                 operation_id,
                 progress_pct=5,
                 message="Запуск Whisper...",
+                language=language,
             )
             self._schedule(operation_id, resume=False, loop=loop)
             self._publish_snapshot(operation_id, loop)
         return operation
 
-    def pause(self, operation_id: str) -> dict:
-        with self._lock:
-            current = self.manager.get(operation_id)
-            if current is None:
-                raise KeyError(operation_id)
-            if current["status"] != "running" or current.get("pending_action"):
-                raise OperationConflictError(
-                    f"Cannot pause operation from {current['status']}"
-                )
-            self.manager.control(operation_id).pause()
-            snapshot = self.manager.update(
-                operation_id,
-                pending_action="pause",
-                message="Останавливаю Whisper на безопасной границе...",
+    def recover_projects(self) -> list[dict]:
+        """Rebuild resumable operations without scheduling any workers.
+
+        A valid final transcript is authoritative. Recovery deliberately leaves
+        any stale checkpoint beside it untouched; startup must never risk the
+        completed result merely to clean up an obsolete recovery artifact.
+        """
+        if self.project_store is None:
+            return []
+
+        recovered = []
+        listing = self.project_store.list_projects()
+        project_ids = [
+            summary.get("project_id")
+            for summary in listing.get("projects", [])
+            if summary.get("project_id")
+        ]
+        projects_root = Path(self.project_store.projects_root)
+        if projects_root.is_dir():
+            project_ids.extend(
+                project_directory.name
+                for project_directory in projects_root.iterdir()
+                if project_directory.is_dir()
+                and project_directory.name not in project_ids
             )
+
+        for project_id in project_ids:
+            if not project_id:
+                continue
+            try:
+                if self.project_store.load_transcript(project_id) is not None:
+                    continue
+                checkpoint = self.project_store.load_checkpoint(project_id)
+                if checkpoint is None:
+                    continue
+                project = self.project_store.get_project(project_id)
+                source_path = Path(project["source_path"])
+                if not source_path.is_absolute():
+                    source_path = Path(self.project_store.project_root) / source_path
+                legacy_root = getattr(
+                    self.project_store, "legacy_transcripts_dir", None
+                )
+                transcript_path = (
+                    Path(legacy_root) / f"{project_id}.json"
+                    if legacy_root is not None
+                    else Path(self.project_store.projects_root)
+                    / project_id
+                    / "transcript.json"
+                )
+                metadata = {
+                    "video_path": str(source_path),
+                    "language": checkpoint.get("language"),
+                    "transcript_path": transcript_path,
+                    "loop": None,
+                    "generation": 1,
+                }
+                restored = self.manager.restore(checkpoint)
+                if restored is None:
+                    continue
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                logger.exception("Could not recover transcription project %s", project_id)
+                continue
+
+            with self._lock:
+                self._metadata[restored["operation_id"]] = metadata
+                self._video_operations[("transcription", project_id)] = restored[
+                    "operation_id"
+                ]
+            recovered.append(restored)
+        return recovered
+
+    def pause(self, operation_id: str) -> dict:
+        with self._operation_action_lock(operation_id):
+            with self._lock:
+                current = self.manager.get(operation_id)
+                if current is None:
+                    raise KeyError(operation_id)
+                if current["status"] != "running" or current.get("pending_action"):
+                    raise OperationConflictError(
+                        f"Cannot pause operation from {current['status']}"
+                    )
+                self.manager.control(operation_id).pause()
+                snapshot = self.manager.update(
+                    operation_id,
+                    pending_action="pause",
+                    message="Останавливаю Whisper на безопасной границе...",
+                )
         self._publish_for_operation(operation_id)
         return snapshot
 
@@ -107,52 +185,67 @@ class TranscriptionService:
         operation_id: str,
         loop: asyncio.AbstractEventLoop,
     ) -> dict:
-        with self._lock:
-            current = self.manager.get(operation_id)
-            if current is None:
-                raise KeyError(operation_id)
-            if current["status"] == "paused":
-                if current.get("pending_action"):
-                    raise OperationConflictError("Operation already has a pending action")
-                self.manager.control(operation_id).resume()
-                snapshot = self.manager.update(
-                    operation_id,
-                    pending_action="resume",
-                    message="Возобновляю Whisper...",
-                )
-                self._publish_snapshot(operation_id, loop)
-                return snapshot
-            if current["status"] != "stopped":
-                raise OperationConflictError(
-                    f"Cannot resume operation from {current['status']}"
-                )
+        current = self.manager.get(operation_id)
+        if (
+            self.project_store is not None
+            and current is not None
+            and current["status"] == "stopped"
+            and not self.project_store.source_status(current["video_id"])["exists"]
+        ):
+            raise OperationConflictError("Source file is missing")
 
-            if operation_id not in self._metadata:
-                raise OperationConflictError("Operation has no resumable worker metadata")
-            self._metadata[operation_id]["loop"] = loop
-            self._metadata[operation_id]["generation"] += 1
-            generation = self._metadata[operation_id]["generation"]
-            snapshot = self.manager.transition(operation_id, "running")
-            snapshot = self.manager.update(operation_id, pending_action=None)
-        self._schedule(operation_id, resume=True, loop=loop, generation=generation)
-        self._publish_snapshot(operation_id, loop)
-        return snapshot
+        with self._operation_action_lock(operation_id):
+            with self._lock:
+                current = self.manager.get(operation_id)
+                if current is None:
+                    raise KeyError(operation_id)
+                if current["status"] == "paused":
+                    if current.get("pending_action"):
+                        raise OperationConflictError(
+                            "Operation already has a pending action"
+                        )
+                    self.manager.control(operation_id).resume()
+                    snapshot = self.manager.update(
+                        operation_id,
+                        pending_action="resume",
+                        message="Возобновляю Whisper...",
+                    )
+                    self._publish_snapshot(operation_id, loop)
+                    return snapshot
+                if current["status"] != "stopped":
+                    raise OperationConflictError(
+                        f"Cannot resume operation from {current['status']}"
+                    )
+
+                if operation_id not in self._metadata:
+                    raise OperationConflictError(
+                        "Operation has no resumable worker metadata"
+                    )
+                self._metadata[operation_id]["loop"] = loop
+                self._metadata[operation_id]["generation"] += 1
+                generation = self._metadata[operation_id]["generation"]
+                snapshot = self.manager.transition(operation_id, "running")
+                snapshot = self.manager.update(operation_id, pending_action=None)
+            self._schedule(operation_id, resume=True, loop=loop, generation=generation)
+            self._publish_snapshot(operation_id, loop)
+            return snapshot
 
     def stop(self, operation_id: str) -> dict:
-        with self._lock:
-            current = self.manager.get(operation_id)
-            if current is None:
-                raise KeyError(operation_id)
-            if current["status"] not in {"running", "paused"}:
-                raise OperationConflictError(
-                    f"Cannot stop operation from {current['status']}"
+        with self._operation_action_lock(operation_id):
+            with self._lock:
+                current = self.manager.get(operation_id)
+                if current is None:
+                    raise KeyError(operation_id)
+                if current["status"] not in {"running", "paused"}:
+                    raise OperationConflictError(
+                        f"Cannot stop operation from {current['status']}"
+                    )
+                self.manager.control(operation_id).request_stop()
+                snapshot = self.manager.update(
+                    operation_id,
+                    pending_action="stop",
+                    message="Останавливаю Whisper и сохраняю прогресс...",
                 )
-            self.manager.control(operation_id).request_stop()
-            snapshot = self.manager.update(
-                operation_id,
-                pending_action="stop",
-                message="Останавливаю Whisper и сохраняю прогресс...",
-            )
         self._publish_for_operation(operation_id)
         return snapshot
 
@@ -257,6 +350,7 @@ class TranscriptionService:
                 operation_id,
                 partial_result=copy.deepcopy(partial),
             )
+            self._persist_checkpoint(operation_id)
             self._publish_snapshot(operation_id, loop)
 
         def on_control_state(state: str) -> None:
@@ -275,6 +369,7 @@ class TranscriptionService:
                 else:
                     return
                 self.manager.update(operation_id, pending_action=None)
+            self._persist_checkpoint(operation_id)
             self._publish_snapshot(operation_id, loop)
 
         try:
@@ -309,27 +404,51 @@ class TranscriptionService:
             final_result = copy.deepcopy(result)
             final_result.pop("is_complete", None)
             final_result.pop("checkpoint", None)
-            with self._lock:
-                latest = self.manager.get(operation_id)
-                if (
-                    not self._is_current_generation(operation_id, generation)
-                    or latest is None
-                    or latest["status"] != "running"
-                    or latest.get("pending_action")
-                ):
-                    return
-                self._write_final_transcript(
-                    metadata["transcript_path"], operation_id, final_result
-                )
-                self.manager.update(
-                    operation_id,
-                    partial_result=final_result,
-                    progress_pct=100,
-                    message="Транскрипция завершена!",
-                    eta_seconds=0,
-                    pending_action=None,
-                )
-                self.manager.transition(operation_id, "completed")
+            with self._operation_action_lock(operation_id):
+                with self._lock:
+                    latest = self.manager.get(operation_id)
+                    if (
+                        not self._is_current_generation(operation_id, generation)
+                        or latest is None
+                        or latest["status"] != "running"
+                        or latest.get("pending_action")
+                    ):
+                        return
+
+                if self.project_store is not None:
+                    self.project_store.save_transcript(
+                        latest["video_id"], final_result
+                    )
+
+                with self._lock:
+                    latest = self.manager.get(operation_id)
+                    if (
+                        not self._is_current_generation(operation_id, generation)
+                        or latest is None
+                        or latest["status"] != "running"
+                        or latest.get("pending_action")
+                    ):
+                        return
+                    self._write_final_transcript(
+                        metadata["transcript_path"], operation_id, final_result
+                    )
+                    self.manager.update(
+                        operation_id,
+                        partial_result=final_result,
+                        progress_pct=100,
+                        message="Транскрипция завершена!",
+                        eta_seconds=0,
+                        pending_action=None,
+                    )
+                    self.manager.transition(operation_id, "completed")
+
+                if self.project_store is not None:
+                    try:
+                        self.project_store.remove_checkpoint(latest["video_id"])
+                    except OSError:
+                        logger.exception(
+                            "Final transcript saved but checkpoint cleanup failed"
+                        )
             self._publish_snapshot(operation_id, loop)
         except Exception as exc:
             logger.exception("Transcription worker failed")
@@ -345,7 +464,19 @@ class TranscriptionService:
                 latest = self.manager.get(operation_id)
                 if latest and latest["status"] in {"queued", "running", "paused"}:
                     self.manager.transition(operation_id, "failed")
+                self._persist_checkpoint(operation_id)
                 self._publish_snapshot(operation_id, loop)
+
+    def _persist_checkpoint(self, operation_id: str) -> None:
+        if self.project_store is None:
+            return
+        snapshot = self.manager.get(operation_id)
+        if snapshot is not None:
+            self.project_store.save_checkpoint(snapshot["video_id"], snapshot)
+
+    def _operation_action_lock(self, operation_id: str) -> threading.Lock:
+        with self._lock:
+            return self._action_locks.setdefault(operation_id, threading.Lock())
 
     def _is_current_generation(self, operation_id: str, generation: int) -> bool:
         with self._lock:

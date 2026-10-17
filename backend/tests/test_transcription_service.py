@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import sys
 import tempfile
@@ -31,6 +32,48 @@ def partial_result(text="первая часть", checkpoint=2.0, complete=Fals
         "checkpoint": checkpoint,
         "is_complete": complete,
     }
+
+
+class FakeProjectStore:
+    def __init__(self):
+        self.checkpoints = {}
+        self.transcripts = {}
+        self.calls = []
+        self.fail_transcript_write = False
+        self.status_provider = None
+        self.status_at_remove = []
+
+    def save_checkpoint(self, project_id, checkpoint):
+        saved = copy.deepcopy(checkpoint)
+        self.checkpoints[project_id] = saved
+        self.calls.append(("save_checkpoint", project_id, saved))
+        return copy.deepcopy(saved)
+
+    def load_checkpoint(self, project_id):
+        checkpoint = self.checkpoints.get(project_id)
+        return copy.deepcopy(checkpoint) if checkpoint is not None else None
+
+    def remove_checkpoint(self, project_id):
+        if self.status_provider is not None:
+            self.status_at_remove.append(self.status_provider())
+        self.calls.append(("remove_checkpoint", project_id))
+        return self.checkpoints.pop(project_id, None) is not None
+
+    def save_transcript(self, project_id, transcript):
+        saved = copy.deepcopy(transcript)
+        if self.fail_transcript_write:
+            self.calls.append(("save_transcript", project_id, saved))
+            raise OSError("project transcript write failed")
+        self.transcripts[project_id] = saved
+        self.calls.append(("save_transcript", project_id, saved))
+        return copy.deepcopy(saved)
+
+    def load_transcript(self, project_id):
+        transcript = self.transcripts.get(project_id)
+        return copy.deepcopy(transcript) if transcript is not None else None
+
+    def source_status(self, _project_id):
+        return {"exists": True, "diagnostic": None}
 
 
 class ControllableTranscriber:
@@ -109,6 +152,7 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = tempfile.TemporaryDirectory(dir=PROJECT_ROOT / "temp")
         self.transcript_path = Path(self.temp_dir.name) / "video-1.json"
         self.events = []
+        self.store = FakeProjectStore()
 
         async def publish(event):
             self.events.append(event)
@@ -131,7 +175,47 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await asyncio.to_thread(event.wait, timeout))
 
     def make_service(self, transcriber):
-        return TranscriptionService(OperationManager(), transcriber, self.publish)
+        service = TranscriptionService(
+            OperationManager(), transcriber, self.publish, self.store
+        )
+        self.store.status_provider = lambda: service.manager.list_operations(
+            video_id="video-1"
+        )[0]["status"]
+        return service
+
+    async def wait_for_persisted_status(self, expected, timeout=1.0):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            checkpoint = self.store.checkpoints.get("video-1")
+            if checkpoint and checkpoint["status"] == expected:
+                return checkpoint
+            await asyncio.sleep(0.01)
+        self.fail(
+            f"Checkpoint did not reach {expected}: "
+            f"{self.store.checkpoints.get('video-1')}"
+        )
+
+    async def test_partial_and_paused_snapshots_are_persisted(self):
+        transcriber = ControllableTranscriber()
+        service = self.make_service(transcriber)
+        operation = service.start(
+            "video-1",
+            "video.mp4",
+            None,
+            self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+
+        await self.assert_event_set(transcriber.first_started)
+        partial = await self.wait_for_persisted_status("running")
+        self.assertEqual(partial["partial_result"], partial_result())
+
+        service.pause(operation["operation_id"])
+        await self.assert_event_set(transcriber.paused)
+        paused = await self.wait_for_persisted_status("paused")
+        self.assertIsNone(paused["pending_action"])
+
+        await service.shutdown(timeout=0.5)
 
     async def test_start_returns_before_worker_finishes(self):
         transcriber = ControllableTranscriber()
@@ -191,6 +275,8 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         snapshot = service.manager.get(operation["operation_id"])
         self.assertEqual(snapshot["partial_result"]["checkpoint"], 2.0)
         self.assertFalse(self.transcript_path.exists())
+        persisted = await self.wait_for_persisted_status("stopped")
+        self.assertEqual(persisted["partial_result"], snapshot["partial_result"])
 
     async def test_resume_stopped_operation_reuses_partial_result(self):
         transcriber = ControllableTranscriber()
@@ -227,6 +313,17 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         transcriber.release.set()
         await self.wait_for_status(service, first["operation_id"], "completed")
 
+        call_names = [call[0] for call in self.store.calls]
+        self.assertLess(
+            call_names.index("save_transcript"),
+            call_names.index("remove_checkpoint"),
+        )
+        self.assertEqual(self.store.status_at_remove, ["completed"])
+        self.assertNotIn("video-1", self.store.checkpoints)
+        self.assertEqual(
+            self.store.transcripts["video-1"]["full_text"], "готовый текст"
+        )
+
         saved = json.loads(self.transcript_path.read_text(encoding="utf-8"))
         self.assertEqual(saved["full_text"], "готовый текст")
         self.assertNotIn("is_complete", saved)
@@ -240,6 +337,29 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reused["operation_id"], first["operation_id"])
         self.assertEqual(reused["status"], "completed")
         self.assertEqual(len(transcriber.calls), 1)
+
+    async def test_final_project_write_failure_fails_and_keeps_checkpoint(self):
+        transcriber = ControllableTranscriber()
+        service = self.make_service(transcriber)
+        operation = service.start(
+            "video-1",
+            "video.mp4",
+            None,
+            self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        self.store.fail_transcript_write = True
+        transcriber.release.set()
+
+        failed = await self.wait_for_status(
+            service, operation["operation_id"], "failed"
+        )
+
+        self.assertIn("project transcript write failed", failed["error"])
+        self.assertIn("video-1", self.store.checkpoints)
+        self.assertEqual(self.store.checkpoints["video-1"]["status"], "failed")
+        self.assertNotIn("remove_checkpoint", [call[0] for call in self.store.calls])
+        self.assertFalse(self.transcript_path.exists())
 
     async def test_pause_and_resume_wait_for_worker_acknowledgement(self):
         transcriber = ControllableTranscriber()
@@ -335,6 +455,8 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed["partial_result"]["checkpoint"], 2.0)
         self.assertIn("boom from fake worker", failed["error"])
         self.assertFalse(self.transcript_path.exists())
+        persisted = await self.wait_for_persisted_status("failed")
+        self.assertEqual(persisted["error"], failed["error"])
 
 
 if __name__ == "__main__":
