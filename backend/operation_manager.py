@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 ACTIVE_STATUSES = {"queued", "running", "paused"}
 RESUMABLE_STATUSES = ACTIVE_STATUSES | {"stopped"}
 TERMINAL_STATUSES = {"stopped", "completed", "failed", "cancelled"}
+RESTORABLE_STATUSES = RESUMABLE_STATUSES | {"failed", "completed", "cancelled"}
+RECOVERY_MESSAGE = "Прервано после закрытия приложения — можно продолжить"
 
 
 class OperationConflictError(RuntimeError):
@@ -49,6 +51,25 @@ class OperationControl:
 
 
 class OperationManager:
+    _RESTORE_FIELDS = {
+        "operation_id",
+        "operation_type",
+        "video_id",
+        "status",
+        "progress_pct",
+        "message",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "finished_at",
+        "eta_seconds",
+        "error",
+        "pending_action",
+        "partial_result",
+        "language",
+    }
+    _RESTORE_REQUIRED_FIELDS = _RESTORE_FIELDS - {"language"}
+
     _TRANSITIONS = {
         "queued": {"running", "failed", "cancelled"},
         "running": {"paused", "stopped", "completed", "failed", "cancelled"},
@@ -91,6 +112,7 @@ class OperationManager:
                 "error": None,
                 "pending_action": None,
                 "partial_result": None,
+                "language": None,
                 "control": OperationControl(),
             }
             self._records[operation_id] = record
@@ -192,6 +214,110 @@ class OperationManager:
             if record is None:
                 raise KeyError(operation_id)
             return record["control"]
+
+    def restore(self, snapshot: dict) -> dict | None:
+        """Restore a saved transcription snapshot without starting work."""
+        record = self._normalize_restored_snapshot(snapshot)
+        if record is None:
+            return None
+
+        with self._lock:
+            operation_id = record["operation_id"]
+            if operation_id in self._records:
+                raise ValueError(f"Operation already exists: {operation_id}")
+            record["control"] = OperationControl()
+            self._records[operation_id] = record
+            return self._snapshot(record)
+
+    @classmethod
+    def _normalize_restored_snapshot(cls, snapshot: dict) -> dict | None:
+        if not isinstance(snapshot, dict):
+            raise ValueError("Operation snapshot must be a dictionary")
+
+        unsupported_fields = set(snapshot) - cls._RESTORE_FIELDS
+        if unsupported_fields:
+            raise ValueError(
+                f"Unsupported operation fields: {', '.join(sorted(unsupported_fields))}"
+            )
+        missing_fields = cls._RESTORE_REQUIRED_FIELDS - set(snapshot)
+        if missing_fields:
+            raise ValueError(
+                f"Missing operation fields: {', '.join(sorted(missing_fields))}"
+            )
+
+        for field in ("operation_id", "video_id"):
+            value = snapshot[field]
+            if not isinstance(value, str):
+                raise ValueError(f"Invalid {field}")
+            try:
+                uuid.UUID(value)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid {field}") from exc
+
+        if snapshot["operation_type"] != "transcription":
+            raise ValueError("Unsupported operation type")
+        status = snapshot["status"]
+        if status not in RESTORABLE_STATUSES:
+            raise ValueError("Unsupported operation status")
+        if not isinstance(snapshot["progress_pct"], int) or isinstance(
+            snapshot["progress_pct"], bool
+        ) or not 0 <= snapshot["progress_pct"] <= 100:
+            raise ValueError("Invalid operation progress")
+        if not isinstance(snapshot["message"], str):
+            raise ValueError("Invalid operation message")
+        if snapshot["partial_result"] is not None and not isinstance(
+            snapshot["partial_result"], dict
+        ):
+            raise ValueError("Invalid partial result")
+
+        cls._validate_timestamp(snapshot["created_at"], "created_at")
+        cls._validate_timestamp(snapshot["updated_at"], "updated_at")
+        cls._validate_timestamp(snapshot["started_at"], "started_at", allow_none=True)
+        cls._validate_timestamp(snapshot["finished_at"], "finished_at", allow_none=True)
+
+        eta_seconds = snapshot["eta_seconds"]
+        if eta_seconds is not None and (
+            not isinstance(eta_seconds, (int, float))
+            or isinstance(eta_seconds, bool)
+            or eta_seconds < 0
+        ):
+            raise ValueError("Invalid operation ETA")
+        if snapshot["error"] is not None and not isinstance(snapshot["error"], str):
+            raise ValueError("Invalid operation error")
+        if snapshot["pending_action"] is not None and not isinstance(
+            snapshot["pending_action"], str
+        ):
+            raise ValueError("Invalid pending operation action")
+        if snapshot.get("language") is not None and not isinstance(
+            snapshot["language"], str
+        ):
+            raise ValueError("Invalid operation language")
+
+        if status in {"completed", "cancelled"}:
+            return None
+
+        record = {
+            field: copy.deepcopy(snapshot.get(field)) for field in cls._RESTORE_FIELDS
+        }
+        if status in RESUMABLE_STATUSES:
+            record.update(
+                status="stopped",
+                message=RECOVERY_MESSAGE,
+                pending_action=None,
+                eta_seconds=None,
+            )
+        return record
+
+    @staticmethod
+    def _validate_timestamp(value: str | None, field: str, allow_none: bool = False) -> None:
+        if value is None and allow_none:
+            return
+        if not isinstance(value, str):
+            raise ValueError(f"Invalid {field}")
+        try:
+            datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {field}") from exc
 
     def _find_record(
         self,
