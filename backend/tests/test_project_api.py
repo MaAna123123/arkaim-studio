@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -14,8 +15,39 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 import main  # noqa: E402
+from operation_manager import OperationManager  # noqa: E402
 from transcription_service import TranscriptionService  # noqa: E402
 from project_store import ProjectStore  # noqa: E402
+
+
+def project_checkpoint(project_id, *, status="running", **updates):
+    checkpoint = {
+        "schema_version": 1,
+        "operation_id": str(uuid.uuid4()),
+        "operation_type": "transcription",
+        "video_id": project_id,
+        "status": status,
+        "progress_pct": 37,
+        "message": "Распознавание продолжается",
+        "created_at": "2026-10-17T08:00:00+00:00",
+        "updated_at": "2026-10-17T08:10:00+00:00",
+        "started_at": "2026-10-17T08:01:00+00:00",
+        "finished_at": None,
+        "eta_seconds": 120,
+        "error": None,
+        "pending_action": None,
+        "partial_result": {
+            "checkpoint": 33.0,
+            "full_text": "частичный текст",
+            "segments": [],
+            "words": [],
+            "paragraphs": [],
+            "is_complete": False,
+        },
+        "language": "ru",
+    }
+    checkpoint.update(updates)
+    return checkpoint
 
 
 class ProjectApiTests(unittest.TestCase):
@@ -39,13 +71,19 @@ class ProjectApiTests(unittest.TestCase):
             self.source,
             {"duration": 42.5, "width": 1920, "height": 1080},
         )
-        self.patcher = patch.object(main, "project_store", self.store)
-        self.patcher.start()
+        self.manager = OperationManager()
+        self.patchers = [
+            patch.object(main, "project_store", self.store),
+            patch.object(main, "operation_manager", self.manager),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
         self.client = TestClient(main.app)
 
     def tearDown(self):
         self.client.close()
-        self.patcher.stop()
+        for patcher in reversed(self.patchers):
+            patcher.stop()
         self.temp_dir.cleanup()
 
     def test_list_projects_returns_recent_public_summaries_without_paths(self):
@@ -106,6 +144,9 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(project_file.read_bytes(), before)
 
     def test_patch_project_rejects_non_editor_fields(self):
+        project_file = self.store.projects_root / self.project_id / "project.json"
+        before = project_file.read_bytes()
+
         response = self.client.patch(
             f"/api/projects/{self.project_id}",
             json={
@@ -115,7 +156,94 @@ class ProjectApiTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("редактор", response.json()["detail"].lower())
+        self.assertEqual(project_file.read_bytes(), before)
+
+    def test_detail_marks_parseable_malformed_checkpoint_non_resumable_without_leaking_it(self):
+        checkpoint_file = self.store.projects_root / self.project_id / "checkpoint.json"
+        self.store.save_checkpoint(self.project_id, {})
+        before = checkpoint_file.read_bytes()
+
+        response = self.client.get(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["transcription"]["resume_available"], False)
+        self.assertEqual(
+            response.json()["transcription"]["diagnostic"]["code"],
+            "checkpoint_invalid",
+        )
+        self.assertEqual(checkpoint_file.read_bytes(), before)
+
+    def test_detail_public_checkpoint_projection_omits_paths_and_secrets(self):
+        self.store.save_checkpoint(
+            self.project_id,
+            project_checkpoint(
+                self.project_id,
+                status="stopped",
+                message=r"E:\\private\\source.mp4 api_key=hidden",
+                error="oauth token=hidden subscription=https://example.test/private",
+                partial_result={
+                    "checkpoint": 33.0,
+                    "source_path": r"E:\\private\\source.mp4",
+                    "api_key": "hidden",
+                    "nested": {"token": "hidden"},
+                },
+            ),
+        )
+
+        response = self.client.get(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(response.status_code, 200)
+        projection = response.json()["transcription"]
+        self.assertFalse(projection["resume_available"])
+        self.assertNotIn("message", projection)
+        self.assertNotIn("error", projection)
+        self.assertNotIn("partial_result", projection)
+        self.assertNotIn(r"E:\\private", response.text)
+        self.assertNotIn("api_key", response.text)
+        self.assertNotIn("subscription=", response.text)
+
+    def test_list_and_detail_suppress_stale_checkpoint_when_final_transcript_exists(self):
+        self.store.save_checkpoint(self.project_id, project_checkpoint(self.project_id))
+        self.store.save_transcript(
+            self.project_id,
+            {"full_text": "готовый текст", "segments": [], "words": []},
+        )
+
+        listing = self.client.get("/api/projects", params={"limit": 20})
+        detail = self.client.get(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(detail.status_code, 200)
+        self.assertTrue(listing.json()["projects"][0]["has_transcript"])
+        self.assertIsNone(listing.json()["projects"][0]["transcription"])
+        self.assertTrue(detail.json()["has_transcript"])
+        self.assertIsNone(detail.json()["transcription"])
+
+    def test_list_and_detail_prefer_recovered_stopped_operation_to_running_disk_checkpoint(self):
+        checkpoint = project_checkpoint(self.project_id, status="running")
+        self.store.save_checkpoint(self.project_id, checkpoint)
+        restored = self.manager.restore(checkpoint)
+
+        listing = self.client.get("/api/projects", params={"limit": 20})
+        detail = self.client.get(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(restored["status"], "stopped")
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(
+            listing.json()["projects"][0]["transcription"]["operation_id"],
+            checkpoint["operation_id"],
+        )
+        self.assertEqual(
+            listing.json()["projects"][0]["transcription"]["status"], "stopped"
+        )
+        self.assertEqual(
+            detail.json()["transcription"]["operation_id"],
+            checkpoint["operation_id"],
+        )
+        self.assertEqual(detail.json()["transcription"]["status"], "stopped")
 
     def test_corrupt_project_returns_500_without_rewriting_saved_data(self):
         project_file = self.store.projects_root / self.project_id / "project.json"
@@ -245,22 +373,31 @@ class IngestionProjectTests(unittest.TestCase):
         self.assertEqual(project["editor"]["clip_results"], [clip])
 
 
-class FakeRestartService:
-    def __init__(self, manager):
-        self.manager = manager
-        self.start_calls = []
+class RestartPartialTranscriber:
+    """Lets the real worker start while retaining an incomplete replacement."""
 
-    def start(self, video_id, video_path, language, transcript_path, _loop):
-        self.start_calls.append(
-            (video_id, video_path, language, Path(transcript_path))
-        )
-        return self.manager.create("transcription", video_id)
+    def __init__(self):
+        self.started = threading.Event()
 
-    def recover_projects(self):
-        return []
-
-    async def shutdown(self, timeout=2.0):
-        return None
+    def transcribe(
+        self,
+        _video_path,
+        language=None,
+        on_progress=None,
+        control=None,
+        on_partial=None,
+        on_control_state=None,
+        resume_from=0.0,
+        retained_result=None,
+    ):
+        self.started.set()
+        return {
+            "full_text": "restart partial",
+            "segments": [],
+            "words": [],
+            "checkpoint": 0.0,
+            "is_complete": False,
+        }
 
 
 class ProjectTranscriptionRestartTests(unittest.TestCase):
@@ -305,7 +442,17 @@ class ProjectTranscriptionRestartTests(unittest.TestCase):
         )
         self.old_operation = self.manager.transition(old["operation_id"], "stopped")
         self.store.save_checkpoint(self.project_id, self.old_operation)
-        self.service = FakeRestartService(self.manager)
+        self.transcriber = RestartPartialTranscriber()
+
+        async def publish(_event):
+            return None
+
+        self.service = TranscriptionService(
+            self.manager,
+            self.transcriber,
+            publish,
+            self.store,
+        )
         self.patchers = [
             patch.object(main, "project_store", self.store),
             patch.object(main, "operation_manager", self.manager),
@@ -334,13 +481,17 @@ class ProjectTranscriptionRestartTests(unittest.TestCase):
         self.assertNotEqual(
             replacement["operation_id"], self.old_operation["operation_id"]
         )
-        self.assertEqual(replacement["progress_pct"], 0)
+        self.assertEqual(replacement["progress_pct"], 5)
         self.assertIsNone(replacement["partial_result"])
+        self.assertTrue(self.transcriber.started.wait(1.0))
         self.assertEqual(
             self.manager.get(self.old_operation["operation_id"])["status"],
             "cancelled",
         )
-        self.assertIsNone(self.store.load_checkpoint(self.project_id))
+        self.assertEqual(
+            self.store.load_checkpoint(self.project_id)["operation_id"],
+            replacement["operation_id"],
+        )
         self.assertEqual(
             self.store.get_project(self.project_id)["editor"], before_editor
         )
@@ -364,7 +515,7 @@ class ProjectTranscriptionRestartTests(unittest.TestCase):
             self.manager.get(self.old_operation["operation_id"])["status"],
             "stopped",
         )
-        self.assertEqual(self.service.start_calls, [])
+        self.assertFalse(self.transcriber.started.is_set())
 
     def test_restart_startup_failure_keeps_saved_checkpoint(self):
         checkpoint_file = self.store.projects_root / self.project_id / "checkpoint.json"
@@ -372,8 +523,9 @@ class ProjectTranscriptionRestartTests(unittest.TestCase):
 
         with patch.object(
             self.service,
-            "start",
+            "restart_from_zero",
             side_effect=OSError("Whisper worker is unavailable"),
+            create=True,
         ):
             response = self.client.post(
                 f"/api/projects/{self.project_id}/transcription/restart"

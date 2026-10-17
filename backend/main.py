@@ -13,7 +13,7 @@ from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("videopril")
@@ -229,33 +229,68 @@ def _project_storage_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=500, detail="Не удалось прочитать данные проекта")
 
 
+def _checkpoint_diagnostic(code: str) -> dict:
+    return {
+        "resume_available": False,
+        "diagnostic": {
+            "code": code,
+            "message": "Сохранённый прогресс нельзя продолжить",
+        },
+    }
+
+
+def _public_operation_snapshot(operation: dict) -> dict:
+    partial_result = operation.get("partial_result")
+    checkpoint = (
+        partial_result.get("checkpoint")
+        if isinstance(partial_result, dict)
+        else None
+    )
+    if isinstance(checkpoint, bool) or not isinstance(checkpoint, (int, float)):
+        checkpoint = None
+    return {
+        "operation_id": operation["operation_id"],
+        "status": operation["status"],
+        "progress_pct": operation["progress_pct"],
+        "checkpoint": checkpoint,
+        "resume_available": operation["status"] == "stopped",
+    }
+
+
+def _validated_checkpoint(project_id: str, checkpoint: object) -> dict | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    try:
+        normalized = OperationManager().restore(checkpoint)
+    except (TypeError, ValueError):
+        return None
+    if normalized is None or normalized.get("video_id") != project_id:
+        return None
+    return normalized
+
+
 def _checkpoint_public_snapshot(project_id: str) -> dict | None:
     operation = operation_manager.find_for_video(project_id, include_stopped=True)
     if operation is not None:
-        return operation
+        return _public_operation_snapshot(operation)
     try:
         checkpoint = project_store.load_checkpoint(project_id)
     except FileNotFoundError:
         return None
     except (OSError, ValueError, json.JSONDecodeError):
-        return {
-            "resume_available": False,
-            "diagnostic": {
-                "code": "checkpoint_unreadable",
-                "message": "Сохранённый прогресс нельзя продолжить",
-            },
-        }
-    if not isinstance(checkpoint, dict):
+        return _checkpoint_diagnostic("checkpoint_unreadable")
+    if checkpoint is None:
         return None
-    return {
-        key: checkpoint.get(key)
-        for key in (
-            "operation_id", "operation_type", "video_id", "status",
-            "progress_pct", "message", "created_at", "updated_at",
-            "started_at", "finished_at", "eta_seconds", "error",
-            "pending_action", "partial_result", "language",
-        )
-    }
+    if _validated_checkpoint(project_id, checkpoint) is None:
+        return _checkpoint_diagnostic("checkpoint_invalid")
+    return _checkpoint_diagnostic("checkpoint_not_recovered")
+
+
+def _project_transcription_snapshot(project_id: str, transcript: dict | None) -> dict | None:
+    """Use one precedence rule for project list and detail responses."""
+    if transcript is not None:
+        return None
+    return _checkpoint_public_snapshot(project_id)
 
 
 def _public_project(project_id: str) -> dict:
@@ -267,7 +302,7 @@ def _public_project(project_id: str) -> dict:
         source_exists=bool(source.get("exists")),
         source_diagnostic=source.get("diagnostic"),
         has_transcript=transcript is not None,
-        transcription=_checkpoint_public_snapshot(project_id),
+        transcription=_project_transcription_snapshot(project_id, transcript),
     )
     return project
 
@@ -277,7 +312,19 @@ async def list_projects(limit: int = 20):
     if not 1 <= limit <= 20:
         raise HTTPException(status_code=400, detail="limit должен быть от 1 до 20")
     try:
-        return project_store.list_projects(limit=limit)
+        listing = project_store.list_projects(limit=limit)
+        for summary in listing["projects"]:
+            project_id = summary["project_id"]
+            try:
+                transcript = project_store.load_transcript(project_id)
+            except (OSError, ValueError, json.JSONDecodeError):
+                transcript = None
+            summary["has_transcript"] = transcript is not None
+            summary["transcription"] = _project_transcription_snapshot(
+                project_id,
+                transcript,
+            )
+        return listing
     except (OSError, ValueError, json.JSONDecodeError,
             UnsupportedProjectSchemaError) as exc:
         raise _project_storage_error(exc) from exc
@@ -294,8 +341,15 @@ async def get_project(project_id: str):
 
 
 @app.patch("/api/projects/{project_id}")
-async def patch_project(project_id: str, request: ProjectEditorPatch):
+async def patch_project(project_id: str, payload: dict):
     normalized_id = _normalize_project_id(project_id)
+    try:
+        request = ProjectEditorPatch.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Разрешены только поля состояния редактора проекта",
+        ) from exc
     try:
         project_store.get_project(normalized_id)
     except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
@@ -336,19 +390,17 @@ async def restart_project_transcription(project_id: str):
         )
 
     try:
-        if existing is not None:
-            operation_manager.transition(existing["operation_id"], "cancelled")
         source_path = Path(project["source_path"])
         if not source_path.is_absolute():
             source_path = Path(project_store.project_root) / source_path
-        operation = transcription_service.start(
+        operation = transcription_service.restart_from_zero(
             normalized_id,
             str(source_path),
             None,
             TRANSCRIPTS_DIR / f"{normalized_id}.json",
             asyncio.get_running_loop(),
+            existing["operation_id"] if existing is not None else None,
         )
-        project_store.remove_checkpoint(normalized_id)
     except OperationConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (OSError, ValueError, json.JSONDecodeError,

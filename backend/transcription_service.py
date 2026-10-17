@@ -91,6 +91,103 @@ class TranscriptionService:
             self._publish_snapshot(operation_id, loop)
         return operation
 
+    def restart_from_zero(
+        self,
+        video_id: str,
+        video_path: str,
+        language: str | None,
+        transcript_path: Path,
+        loop: asyncio.AbstractEventLoop,
+        previous_operation_id: str | None = None,
+    ) -> dict:
+        """Atomically replace a stopped recovery snapshot with a fresh worker.
+
+        The worker is scheduled behind a gate. The old checkpoint remains the
+        durable authority until the new operation's initial checkpoint is
+        written. A scheduling or persistence failure restores the stopped
+        in-memory operation that the existing checkpoint describes.
+        """
+        if self.project_store is None:
+            raise ValueError("Project storage is required for transcription restart")
+
+        previous = None
+        previous_metadata = None
+        key = ("transcription", video_id)
+        with self._lock:
+            if previous_operation_id is not None:
+                previous, operation = self.manager.begin_replacement(
+                    previous_operation_id
+                )
+                previous_metadata = self._metadata.get(previous_operation_id)
+                self._metadata.pop(previous_operation_id, None)
+            else:
+                operation = self.manager.create("transcription", video_id)
+                if operation["status"] != "queued":
+                    raise OperationConflictError("Current transcription is still active")
+
+            operation_id = operation["operation_id"]
+            launch_gate = threading.Event()
+            self._video_operations[key] = operation_id
+            self._metadata[operation_id] = {
+                "video_path": video_path,
+                "language": language,
+                "transcript_path": Path(transcript_path),
+                "loop": loop,
+                "generation": 1,
+                "launch_gate": launch_gate,
+                "checkpoint_committed": False,
+            }
+
+        try:
+            operation = self.manager.update(
+                operation_id,
+                progress_pct=5,
+                message="Запуск Whisper...",
+                language=language,
+            )
+            self._schedule(operation_id, resume=False, loop=loop)
+            checkpoint = self.manager.get(operation_id)
+            if checkpoint is None:
+                raise RuntimeError("Replacement operation disappeared before commit")
+            self.project_store.save_checkpoint(video_id, checkpoint)
+        except Exception:
+            self._rollback_uncommitted_restart(
+                operation_id,
+                previous,
+                previous_metadata,
+                key,
+            )
+            raise
+
+        with self._lock:
+            metadata = self._metadata.get(operation_id)
+            if metadata is None:
+                raise RuntimeError("Replacement operation disappeared after commit")
+            metadata["checkpoint_committed"] = True
+            metadata["launch_gate"].set()
+        self._publish_snapshot(operation_id, loop)
+        return operation
+
+    def _rollback_uncommitted_restart(
+        self,
+        operation_id: str,
+        previous: dict | None,
+        previous_metadata: dict | None,
+        key: tuple[str, str],
+    ) -> None:
+        with self._lock:
+            metadata = self._metadata.pop(operation_id, None)
+            if metadata is not None:
+                metadata.get("launch_gate", threading.Event()).set()
+            if previous is not None:
+                restored = self.manager.rollback_replacement(previous, operation_id)
+                self._video_operations[key] = restored["operation_id"]
+                if previous_metadata is not None:
+                    self._metadata[restored["operation_id"]] = previous_metadata
+            else:
+                self.manager.discard(operation_id)
+                self._video_operations.pop(key, None)
+
     def recover_projects(self) -> list[dict]:
         """Rebuild resumable operations without scheduling any workers.
 
@@ -366,8 +463,26 @@ class TranscriptionService:
         generation: int,
     ) -> None:
         with self._lock:
-            if self._metadata[operation_id]["generation"] != generation:
+            metadata_record = self._metadata.get(operation_id)
+            if (
+                metadata_record is None
+                or metadata_record["generation"] != generation
+            ):
                 return
+            launch_gate = metadata_record.get("launch_gate")
+
+        if launch_gate is not None:
+            launch_gate.wait()
+            with self._lock:
+                metadata_record = self._metadata.get(operation_id)
+                if (
+                    metadata_record is None
+                    or metadata_record["generation"] != generation
+                    or not metadata_record.get("checkpoint_committed")
+                ):
+                    return
+
+        with self._lock:
             metadata = dict(self._metadata[operation_id])
 
         current = self.manager.get(operation_id)

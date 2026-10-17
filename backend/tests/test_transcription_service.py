@@ -175,6 +175,34 @@ class StopReturnTranscriber:
         return copy.deepcopy(self.returned_result)
 
 
+class ImmediateFailureTranscriber:
+    """Fails as soon as the replacement worker is allowed to run."""
+
+    def __init__(self):
+        self.started = threading.Event()
+
+    def transcribe(
+        self,
+        _video_path,
+        language=None,
+        on_progress=None,
+        control=None,
+        on_partial=None,
+        on_control_state=None,
+        resume_from=0.0,
+        retained_result=None,
+    ):
+        self.started.set()
+        raise RuntimeError("replacement worker failed immediately")
+
+
+class FailingExecutorLoop:
+    """Models a synchronous executor scheduling failure without mocking service code."""
+
+    def run_in_executor(self, *_args, **_kwargs):
+        raise OSError("executor scheduling failed")
+
+
 class GenerationRaceTranscriber:
     def __init__(self, arm_validation):
         self.arm_validation = arm_validation
@@ -324,6 +352,60 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_event_set(transcriber.first_started)
         transcriber.release.set()
         await self.wait_for_status(service, operation["operation_id"], "completed")
+
+    async def test_restart_rolls_back_to_stopped_checkpoint_when_scheduling_fails(self):
+        service = self.make_service(ControllableTranscriber())
+        old = service.manager.create("transcription", "video-1")
+        service.manager.transition(old["operation_id"], "running")
+        old = service.manager.transition(old["operation_id"], "stopped")
+        self.store.save_checkpoint("video-1", old)
+        before_checkpoint = copy.deepcopy(self.store.checkpoints["video-1"])
+
+        with self.assertRaisesRegex(OSError, "executor scheduling failed"):
+            service.restart_from_zero(
+                "video-1",
+                "video.mp4",
+                None,
+                self.transcript_path,
+                FailingExecutorLoop(),
+                old["operation_id"],
+            )
+
+        self.assertEqual(
+            service.manager.get(old["operation_id"])["status"], "stopped"
+        )
+        self.assertEqual(self.store.checkpoints["video-1"], before_checkpoint)
+        self.assertEqual(
+            service.manager.find_for_video("video-1")["operation_id"],
+            old["operation_id"],
+        )
+
+    async def test_restart_persists_immediate_worker_failure_as_replacement_checkpoint(self):
+        transcriber = ImmediateFailureTranscriber()
+        service = self.make_service(transcriber)
+        old = service.manager.create("transcription", "video-1")
+        service.manager.transition(old["operation_id"], "running")
+        old = service.manager.transition(old["operation_id"], "stopped")
+        self.store.save_checkpoint("video-1", old)
+
+        replacement = service.restart_from_zero(
+            "video-1",
+            "video.mp4",
+            None,
+            self.transcript_path,
+            asyncio.get_running_loop(),
+            old["operation_id"],
+        )
+
+        await self.assert_event_set(transcriber.started)
+        failed = await self.wait_for_status(
+            service, replacement["operation_id"], "failed"
+        )
+        persisted = await self.wait_for_persisted_status("failed")
+        self.assertNotEqual(replacement["operation_id"], old["operation_id"])
+        self.assertEqual(persisted["operation_id"], replacement["operation_id"])
+        self.assertEqual(persisted["status"], failed["status"])
+        self.assertNotIn("remove_checkpoint", [call[0] for call in self.store.calls])
 
     async def test_duplicate_start_reuses_operation(self):
         transcriber = ControllableTranscriber()

@@ -232,6 +232,39 @@ class OperationManager:
             self._records[operation_id] = record
             return self._snapshot(record)
 
+    def begin_replacement(self, operation_id: str) -> tuple[dict, dict]:
+        """Reserve a stopped operation for replacement while retaining rollback data."""
+        with self._lock:
+            record = self._records.get(operation_id)
+            if record is None:
+                raise KeyError(operation_id)
+            if record["status"] != "stopped":
+                raise OperationConflictError(
+                    f"Cannot replace operation from {record['status']}"
+                )
+            previous = self._snapshot(record)
+            self.transition(operation_id, "cancelled")
+            replacement = self.create("transcription", previous["video_id"])
+            if replacement["operation_id"] == operation_id:
+                raise OperationConflictError("Replacement operation was not created")
+            return previous, replacement
+
+    def rollback_replacement(self, previous: dict, replacement_id: str) -> dict:
+        """Remove an uncommitted replacement and restore its stopped predecessor."""
+        with self._lock:
+            self._records.pop(replacement_id, None)
+            if not isinstance(previous, dict) or previous.get("status") != "stopped":
+                raise ValueError("Replacement predecessor is not recoverable")
+            restored = copy.deepcopy(previous)
+            restored["control"] = OperationControl()
+            self._records[restored["operation_id"]] = restored
+            return self._snapshot(restored)
+
+    def discard(self, operation_id: str) -> None:
+        """Forget an uncommitted operation before any worker is allowed to run."""
+        with self._lock:
+            self._records.pop(operation_id, None)
+
     @classmethod
     def _normalize_restored_snapshot(cls, snapshot: dict) -> dict | None:
         if not isinstance(snapshot, dict):
