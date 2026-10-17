@@ -156,6 +156,14 @@ class ProjectStoreTests(unittest.TestCase):
 
         self.assertEqual(project["video"], {"duration": 9})
 
+    def test_tokenized_url_in_allowed_metadata_is_not_persisted(self):
+        project = self.create_project(video={
+            "duration": 9,
+            "thumbnail": "https://vpn.invalid/s/secret-token",
+        })
+
+        self.assertEqual(project["video"], {"duration": 9})
+
     def test_source_filename_never_returns_an_absolute_path(self):
         project = self.create_project(
             source_filename="E:/private/media/lesson.mp4",
@@ -169,6 +177,19 @@ class ProjectStoreTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.create_project(source_path=Path(self.temp_dir.name) / "lesson.mp4")
+
+    def test_get_project_drops_tampered_relative_source_path_outside_project_root(self):
+        self.create_project()
+        project_file = (
+            self.project_root / "data" / "projects" / self.video_id / "project.json"
+        )
+        tampered = json.loads(project_file.read_text(encoding="utf-8"))
+        tampered["source_path"] = "../../outside/secret.mp4"
+        project_file.write_text(json.dumps(tampered), encoding="utf-8")
+
+        loaded = self.store.get_project(self.video_id)
+
+        self.assertNotIn("source_path", loaded)
 
     def test_atomic_write_uses_a_unique_same_directory_temp_file_and_fsync(self):
         destination = self.project_root / "data" / "projects" / self.video_id / "project.json"

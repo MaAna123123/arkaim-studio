@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import urlsplit
 
 
 SCHEMA_VERSION = 1
@@ -113,10 +114,35 @@ class ProjectStore:
             return False
         if isinstance(value, str):
             path_like = PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute()
-            subscription_url = value.casefold().startswith(("http://", "https://")) and "subscription" in value.casefold()
-            if path_like or subscription_url:
+            remote_url = value.casefold().startswith(("http://", "https://"))
+            if path_like or remote_url:
                 return False
         return True
+
+    @staticmethod
+    def _safe_thumbnail_url(value: Any) -> bool:
+        """Accept only an unauthenticated, non-tokenized image URL for thumbnails."""
+        if not isinstance(value, str):
+            return False
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        return Path(parsed.path).suffix.casefold() in {".gif", ".jpeg", ".jpg", ".png", ".webp"}
+
+    def _safe_video_value(self, field: str, value: Any) -> bool:
+        if field == "thumbnail" and isinstance(value, str) and value.casefold().startswith(("http://", "https://")):
+            return self._safe_thumbnail_url(value)
+        return self._safe_scalar(value)
 
     @staticmethod
     def _source_filename(value: str) -> str:
@@ -130,7 +156,7 @@ class ProjectStore:
         safe: dict[str, Any] = {}
         for field in _VIDEO_SCALAR_FIELDS:
             value = video.get(field)
-            if field in video and self._safe_scalar(value):
+            if field in video and self._safe_video_value(field, value):
                 safe[field] = value
         chapters = video.get("chapters")
         if isinstance(chapters, list):
@@ -213,8 +239,10 @@ class ProjectStore:
         with self._project_lock(normalized_id):
             project = self._read_json(self._project_dir(normalized_id) / "project.json")
 
-        source_path = project.get("source_path", "")
-        if not isinstance(source_path, str) or Path(source_path).is_absolute():
+        source_path = project.get("source_path")
+        try:
+            project["source_path"] = self._relative_source_path(source_path)
+        except (TypeError, ValueError):
             project.pop("source_path", None)
         project["video"] = self._safe_video_metadata(project.get("video"))
         return project
