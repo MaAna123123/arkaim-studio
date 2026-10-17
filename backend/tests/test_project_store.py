@@ -263,6 +263,38 @@ class ProjectStoreTests(unittest.TestCase):
             "video_banner_enabled": False, "video_banner_height": 380,
         })
 
+    def test_update_editor_strips_nested_credentials_and_absolute_paths_but_keeps_safe_context(self):
+        self.create_project()
+        unsafe_path = str(self.project_root / "private" / "subtitle-context.json")
+        updated = self.store.update_editor(self.video_id, {
+            "subtitle_context": {
+                "language": "ru",
+                "speakers": {"0": "Ведущий"},
+                "api_key": "secret-api-key",
+                "cache_path": unsafe_path,
+                "nested": {
+                    "style": "caption",
+                    "oauth_token": "oauth-secret",
+                    "source_file": unsafe_path,
+                },
+            },
+            "segments": [{"start": 0, "end": 12, "text": "Безопасный текст"}],
+        })
+        project_file = self.store._project_dir(self.video_id) / "project.json"
+        saved_text = project_file.read_text(encoding="utf-8")
+
+        self.assertEqual(updated["editor"]["subtitle_context"], {
+            "language": "ru",
+            "speakers": {"0": "Ведущий"},
+            "nested": {"style": "caption"},
+        })
+        self.assertEqual(updated["editor"]["segments"], [
+            {"start": 0, "end": 12, "text": "Безопасный текст"},
+        ])
+        for forbidden in ("secret-api-key", "oauth-secret", unsafe_path):
+            self.assertNotIn(forbidden, saved_text)
+            self.assertNotIn(forbidden, json.dumps(updated, ensure_ascii=False))
+
     def test_list_projects_sorts_bounded_summaries_without_deleting_projects(self):
         source = self.project_root / "backend" / "uploads" / "lesson.mp4"
         source.parent.mkdir(parents=True)
@@ -382,6 +414,30 @@ class ProjectStoreTests(unittest.TestCase):
         }])
         self.assertEqual(checkpoint_file.read_text(encoding="utf-8"), malformed_text)
 
+    def test_list_projects_disables_resume_for_parseable_incomplete_checkpoint(self):
+        self.create_project()
+        checkpoint_file = self.store._project_dir(self.video_id) / "checkpoint.json"
+        malformed_checkpoint = {}
+        checkpoint_file.write_text(json.dumps(malformed_checkpoint), encoding="utf-8")
+        original_checkpoint = checkpoint_file.read_text(encoding="utf-8")
+
+        listing = self.store.list_projects()
+
+        self.assertEqual(len(listing["projects"]), 1)
+        self.assertEqual(listing["projects"][0]["transcription"], {
+            "resume_available": False,
+            "diagnostic": {
+                "code": "checkpoint_invalid",
+                "message": "Сохранённый прогресс нельзя продолжить",
+            },
+        })
+        self.assertEqual(listing["diagnostics"], [{
+            "code": "checkpoint_invalid",
+            "project_id": self.video_id,
+            "message": "Сохранённый прогресс нельзя продолжить",
+        }])
+        self.assertEqual(checkpoint_file.read_text(encoding="utf-8"), original_checkpoint)
+
     def test_unsupported_project_schema_is_reported_without_rewriting_project_or_checkpoint(self):
         self.create_project()
         project_file = self.store._project_dir(self.video_id) / "project.json"
@@ -407,6 +463,48 @@ class ProjectStoreTests(unittest.TestCase):
         })
         self.assertEqual(project_file.read_text(encoding="utf-8"), original_project)
         self.assertEqual(checkpoint_file.read_text(encoding="utf-8"), original_checkpoint)
+
+    def test_mismatched_project_uuid_is_rejected_and_reported_without_rewriting_record(self):
+        self.create_project()
+        project_file = self.store._project_dir(self.video_id) / "project.json"
+        project = json.loads(project_file.read_text(encoding="utf-8"))
+        mismatched_id = str(uuid.UUID(int=61))
+        project["project_id"] = mismatched_id
+        project["video_id"] = mismatched_id
+        project_file.write_text(json.dumps(project), encoding="utf-8")
+        original_project = project_file.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "project identity"):
+            self.store.get_project(self.video_id)
+        self.assertEqual(self.store.list_projects(), {
+            "projects": [],
+            "diagnostics": [{
+                "code": "project_identity_invalid",
+                "project_id": self.video_id,
+                "message": "Недопустимая идентичность проекта",
+            }],
+        })
+        self.assertEqual(project_file.read_text(encoding="utf-8"), original_project)
+
+    def test_non_uuid_video_id_is_rejected_and_reported_without_rewriting_record(self):
+        self.create_project()
+        project_file = self.store._project_dir(self.video_id) / "project.json"
+        project = json.loads(project_file.read_text(encoding="utf-8"))
+        project["video_id"] = "legacy-video-name"
+        project_file.write_text(json.dumps(project), encoding="utf-8")
+        original_project = project_file.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "project identity"):
+            self.store.get_project(self.video_id)
+        self.assertEqual(self.store.list_projects(), {
+            "projects": [],
+            "diagnostics": [{
+                "code": "project_identity_invalid",
+                "project_id": self.video_id,
+                "message": "Недопустимая идентичность проекта",
+            }],
+        })
+        self.assertEqual(project_file.read_text(encoding="utf-8"), original_project)
 
     def test_missing_source_reports_status_without_changing_project_or_checkpoint(self):
         self.create_project(source_path="backend/uploads/missing.mp4")
@@ -454,6 +552,31 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.load_checkpoint(self.video_id))
         self.assertFalse(self.store.remove_checkpoint(self.video_id))
 
+    def test_final_transcript_strips_incomplete_fields_from_saved_and_loaded_payloads(self):
+        self.create_project()
+        transcript = {
+            "full_text": "Готовый текст",
+            "segments": [{"text": "Готовый текст"}],
+            "duration": 123.4,
+            "checkpoint": 412.8,
+            "is_complete": True,
+        }
+
+        saved = self.store.save_transcript(self.video_id, transcript)
+        loaded = self.store.load_transcript(self.video_id)
+        on_disk = json.loads(
+            (self.store._project_dir(self.video_id) / "transcript.json").read_text(encoding="utf-8")
+        )
+
+        expected = {
+            "full_text": "Готовый текст",
+            "segments": [{"text": "Готовый текст"}],
+            "duration": 123.4,
+        }
+        self.assertEqual(saved, expected)
+        self.assertEqual(loaded, expected)
+        self.assertEqual(on_disk, expected)
+
     def test_opening_project_copies_legacy_transcript_without_deleting_legacy_file(self):
         legacy_dir = self.project_root / "backend" / "transcripts"
         legacy_dir.mkdir(parents=True)
@@ -468,6 +591,28 @@ class ProjectStoreTests(unittest.TestCase):
         copied_file = self.store._project_dir(self.video_id) / "transcript.json"
         self.assertEqual(self.store.load_transcript(self.video_id), legacy_transcript)
         self.assertEqual(json.loads(copied_file.read_text(encoding="utf-8")), legacy_transcript)
+        self.assertEqual(json.loads(legacy_file.read_text(encoding="utf-8")), legacy_transcript)
+
+    def test_legacy_transcript_copy_strips_incomplete_fields_without_rewriting_legacy_file(self):
+        legacy_dir = self.project_root / "backend" / "transcripts"
+        legacy_dir.mkdir(parents=True)
+        self.store = ProjectStore(self.project_root, legacy_transcripts_dir=legacy_dir)
+        self.create_project()
+        legacy_file = legacy_dir / f"{self.video_id}.json"
+        legacy_transcript = {
+            "full_text": "Старый готовый текст",
+            "checkpoint": 8.5,
+            "is_complete": True,
+        }
+        legacy_file.write_text(json.dumps(legacy_transcript, ensure_ascii=False), encoding="utf-8")
+
+        loaded = self.store.load_transcript(self.video_id)
+        copied = json.loads(
+            (self.store._project_dir(self.video_id) / "transcript.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(loaded, {"full_text": "Старый готовый текст"})
+        self.assertEqual(copied, {"full_text": "Старый готовый текст"})
         self.assertEqual(json.loads(legacy_file.read_text(encoding="utf-8")), legacy_transcript)
 
 

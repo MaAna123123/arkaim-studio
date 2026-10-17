@@ -48,10 +48,29 @@ _VIDEO_SCALAR_FIELDS = frozenset({
     "has_subtitles", "subtitle_lang", "subtitle_is_auto",
 })
 _CHAPTER_FIELDS = frozenset({"start_time", "end_time", "title", "index"})
+_EDITOR_LIST_FIELDS = frozenset({"segments", "selected", "clip_results"})
+_EDITOR_STRING_FIELDS = frozenset({
+    "subtitle_notice", "aspect_ratio", "text_ad_text", "text_ad_position",
+})
+_EDITOR_BOOLEAN_FIELDS = frozenset({
+    "burn_subtitles", "insert_ad", "text_ad_enabled", "video_banner_enabled",
+})
+_EDITOR_NUMBER_FIELDS = frozenset({
+    "export_padding", "text_ad_interval", "text_ad_opacity", "video_banner_height",
+})
+_SENSITIVE_EDITOR_KEY_PARTS = (
+    "api_key", "token", "secret", "password", "credential", "subscription",
+    "oauth", "private_key",
+)
+_UNSAFE_EDITOR_VALUE = object()
 
 
 class UnsupportedProjectSchemaError(ValueError):
     """A project record was written by a newer incompatible version."""
+
+
+class InvalidProjectIdentityError(ValueError):
+    """A project record is not bound to the directory selected by its UUID."""
 
 
 class ProjectStore:
@@ -178,6 +197,78 @@ class ProjectStore:
             safe["chapters"] = safe_chapters
         return safe
 
+    @staticmethod
+    def _is_sensitive_editor_key(key: Any) -> bool:
+        if not isinstance(key, str):
+            return True
+        normalized = key.casefold()
+        return any(part in normalized for part in _SENSITIVE_EDITOR_KEY_PARTS)
+
+    @staticmethod
+    def _is_safe_editor_string(value: str) -> bool:
+        if PureWindowsPath(value).is_absolute() or PurePosixPath(value).is_absolute():
+            return False
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        if parsed.scheme in {"http", "https"}:
+            return not (
+                parsed.username or parsed.password or parsed.query or parsed.fragment
+                or "subscription" in parsed.path.casefold()
+            )
+        return True
+
+    def _sanitize_editor_value(self, value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return copy.deepcopy(value)
+        if isinstance(value, str):
+            return value if self._is_safe_editor_string(value) else _UNSAFE_EDITOR_VALUE
+        if isinstance(value, list):
+            safe_items = []
+            for item in value:
+                sanitized = self._sanitize_editor_value(item)
+                if sanitized is not _UNSAFE_EDITOR_VALUE:
+                    safe_items.append(sanitized)
+            return safe_items
+        if isinstance(value, dict):
+            safe_mapping = {}
+            for key, item in value.items():
+                if self._is_sensitive_editor_key(key):
+                    continue
+                sanitized = self._sanitize_editor_value(item)
+                if sanitized is not _UNSAFE_EDITOR_VALUE:
+                    safe_mapping[key] = sanitized
+            return safe_mapping
+        return _UNSAFE_EDITOR_VALUE
+
+    def _sanitize_editor_field(self, field: str, value: Any) -> Any:
+        if field in _EDITOR_LIST_FIELDS:
+            return self._sanitize_editor_value(value) if isinstance(value, list) else _UNSAFE_EDITOR_VALUE
+        if field == "subtitle_context":
+            if value is None:
+                return None
+            return self._sanitize_editor_value(value) if isinstance(value, (dict, list)) else _UNSAFE_EDITOR_VALUE
+        if field in _EDITOR_STRING_FIELDS:
+            return self._sanitize_editor_value(value) if isinstance(value, str) else _UNSAFE_EDITOR_VALUE
+        if field in _EDITOR_BOOLEAN_FIELDS:
+            return value if isinstance(value, bool) else _UNSAFE_EDITOR_VALUE
+        if field in _EDITOR_NUMBER_FIELDS:
+            return value if isinstance(value, (int, float)) and not isinstance(value, bool) else _UNSAFE_EDITOR_VALUE
+        return _UNSAFE_EDITOR_VALUE
+
+    def _safe_editor_state(self, editor: Any) -> dict[str, Any]:
+        values = copy.deepcopy(DEFAULT_EDITOR)
+        if not isinstance(editor, dict):
+            return values
+        for field in SUPPORTED_EDITOR_FIELDS:
+            if field not in editor:
+                continue
+            sanitized = self._sanitize_editor_field(field, editor[field])
+            if sanitized is not _UNSAFE_EDITOR_VALUE:
+                values[field] = sanitized
+        return values
+
     def _atomic_write_json(self, destination: str | Path, data: Any) -> None:
         """Durably replace a project JSON file without risking the last valid copy."""
         destination = Path(destination)
@@ -211,8 +302,9 @@ class ProjectStore:
             raise ValueError("project JSON must contain an object")
         return data
 
-    @staticmethod
-    def _validate_project_schema(project: dict[str, Any]) -> None:
+    def _validate_project_schema(
+        self, project: dict[str, Any], expected_project_id: str | None = None
+    ) -> None:
         version = project.get("schema_version")
         if not isinstance(version, int):
             raise ValueError("project schema_version must be an integer")
@@ -220,6 +312,14 @@ class ProjectStore:
             raise UnsupportedProjectSchemaError("unsupported project schema")
         if version != SCHEMA_VERSION:
             raise ValueError("unsupported project schema")
+        if expected_project_id is not None:
+            try:
+                project_id = self._validate_id(project.get("project_id"))
+                video_id = self._validate_id(project.get("video_id"))
+            except ValueError as exc:
+                raise InvalidProjectIdentityError("project identity is invalid") from exc
+            if project_id != expected_project_id or video_id != expected_project_id:
+                raise InvalidProjectIdentityError("project identity must match directory")
 
     def create_project(
         self,
@@ -252,7 +352,7 @@ class ProjectStore:
         normalized_id = self._validate_id(project_id)
         with self._project_lock(normalized_id):
             project = self._read_json(self._project_dir(normalized_id) / "project.json")
-            self._validate_project_schema(project)
+            self._validate_project_schema(project, normalized_id)
 
         source_path = project.get("source_path")
         try:
@@ -260,6 +360,7 @@ class ProjectStore:
         except (TypeError, ValueError):
             project.pop("source_path", None)
         project["video"] = self._safe_video_metadata(project.get("video"))
+        project["editor"] = self._safe_editor_state(project.get("editor"))
         self.load_transcript(normalized_id)
         return project
 
@@ -275,13 +376,13 @@ class ProjectStore:
         destination = self._project_dir(normalized_id) / "project.json"
         with self._project_lock(normalized_id):
             project = self._read_json(destination)
-            self._validate_project_schema(project)
-            editor = project.get("editor")
-            if not isinstance(editor, dict):
-                editor = copy.deepcopy(DEFAULT_EDITOR)
-            else:
-                editor = {**copy.deepcopy(DEFAULT_EDITOR), **editor}
-            editor.update(copy.deepcopy(updates))
+            self._validate_project_schema(project, normalized_id)
+            editor = self._safe_editor_state(project.get("editor"))
+            for field, value in updates.items():
+                sanitized = self._sanitize_editor_field(field, value)
+                if sanitized is _UNSAFE_EDITOR_VALUE:
+                    raise ValueError("invalid editor value")
+                editor[field] = sanitized
             project["editor"] = editor
             project["updated_at"] = self._utc_now()
             self._atomic_write_json(destination, project)
@@ -292,7 +393,7 @@ class ProjectStore:
         normalized_id = self._validate_id(project_id)
         with self._project_lock(normalized_id):
             project = self._read_json(self._project_dir(normalized_id) / "project.json")
-            self._validate_project_schema(project)
+            self._validate_project_schema(project, normalized_id)
         source_path = project.get("source_path")
         try:
             relative_path = self._relative_source_path(source_path)
@@ -321,6 +422,30 @@ class ProjectStore:
             "checkpoint": partial_result.get("checkpoint"),
         }
 
+    def _is_recoverable_checkpoint(self, checkpoint: Any, project_id: str) -> bool:
+        if not isinstance(checkpoint, dict):
+            return False
+        if checkpoint.get("schema_version") != SCHEMA_VERSION:
+            return False
+        try:
+            self._validate_id(checkpoint.get("operation_id"))
+            video_id = self._validate_id(checkpoint.get("video_id"))
+        except ValueError:
+            return False
+        partial_result = checkpoint.get("partial_result")
+        checkpoint_position = (
+            partial_result.get("checkpoint") if isinstance(partial_result, dict) else None
+        )
+        return (
+            video_id == project_id
+            and checkpoint.get("operation_type") == "transcription"
+            and isinstance(checkpoint.get("status"), str)
+            and isinstance(checkpoint.get("progress_pct"), (int, float))
+            and not isinstance(checkpoint.get("progress_pct"), bool)
+            and isinstance(checkpoint_position, (int, float))
+            and not isinstance(checkpoint_position, bool)
+        )
+
     def _project_summary(
         self, project: dict[str, Any], project_directory: Path
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -331,6 +456,12 @@ class ProjectStore:
         if checkpoint_path.is_file():
             try:
                 checkpoint = self._read_json(checkpoint_path)
+                if not self._is_recoverable_checkpoint(checkpoint, project_id):
+                    checkpoint_diagnostic = {
+                        "code": "checkpoint_invalid",
+                        "project_id": project_id,
+                        "message": "Сохранённый прогресс нельзя продолжить",
+                    }
             except (OSError, ValueError, json.JSONDecodeError):
                 checkpoint_diagnostic = {
                     "code": "checkpoint_unreadable",
@@ -388,7 +519,7 @@ class ProjectStore:
                 project_id = self._validate_id(project_directory.name)
                 with self._project_lock(project_id):
                     project = self._read_json(project_directory / "project.json")
-                    self._validate_project_schema(project)
+                    self._validate_project_schema(project, project_id)
                 summary, checkpoint_diagnostic = self._project_summary(project, project_directory)
                 projects.append(summary)
                 if checkpoint_diagnostic:
@@ -398,6 +529,12 @@ class ProjectStore:
                     "code": "project_schema_unsupported",
                     "project_id": project_directory.name,
                     "message": "Неподдерживаемая версия проекта",
+                })
+            except InvalidProjectIdentityError:
+                diagnostics.append({
+                    "code": "project_identity_invalid",
+                    "project_id": project_directory.name,
+                    "message": "Недопустимая идентичность проекта",
                 })
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 diagnostics.append({
@@ -416,7 +553,7 @@ class ProjectStore:
         normalized_id = self._validate_id(project_id)
         project_directory = self._project_dir(normalized_id)
         project = self._read_json(project_directory / "project.json")
-        self._validate_project_schema(project)
+        self._validate_project_schema(project, normalized_id)
         return normalized_id, project_directory
 
     def save_checkpoint(self, project_id: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
@@ -458,9 +595,18 @@ class ProjectStore:
         normalized_id = self._validate_id(project_id)
         with self._project_lock(normalized_id):
             _, project_directory = self._require_project(normalized_id)
-            saved = copy.deepcopy(transcript)
+            saved = self._final_transcript(transcript)
             self._atomic_write_json(project_directory / "transcript.json", saved)
         return saved
+
+    @staticmethod
+    def _final_transcript(transcript: dict[str, Any]) -> dict[str, Any]:
+        """Keep final transcript records free of incomplete-operation state."""
+        return {
+            key: copy.deepcopy(value)
+            for key, value in transcript.items()
+            if key not in {"checkpoint", "is_complete"}
+        }
 
     def load_transcript(self, project_id: str) -> dict[str, Any] | None:
         """Load a completed transcript, copying a legacy result on first open."""
@@ -469,7 +615,7 @@ class ProjectStore:
             _, project_directory = self._require_project(normalized_id)
             destination = project_directory / "transcript.json"
             if destination.is_file():
-                return self._read_json(destination)
+                return self._final_transcript(self._read_json(destination))
             if not self.legacy_transcripts_dir:
                 return None
             legacy_destination = self.legacy_transcripts_dir / f"{normalized_id}.json"
@@ -483,6 +629,6 @@ class ProjectStore:
                 transcript = json.load(transcript_file)
             if not isinstance(transcript, dict):
                 raise ValueError("legacy transcript JSON must contain an object")
-            copied = copy.deepcopy(transcript)
+            copied = self._final_transcript(transcript)
             self._atomic_write_json(destination, copied)
             return copied
