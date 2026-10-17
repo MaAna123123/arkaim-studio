@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -224,6 +225,250 @@ class ProjectStoreTests(unittest.TestCase):
 
         self.assertEqual(destination.read_text(encoding="utf-8"), '{"title":"previous"}')
         self.assertEqual(list(destination.parent.glob("*.tmp-*")), [])
+
+    def test_update_editor_updates_only_allowlisted_fields_and_preserves_other_editor_state(self):
+        self.create_project()
+        with patch.object(self.store, "_utc_now", return_value="2026-10-17T12:00:00Z"):
+            updated = self.store.update_editor(self.video_id, {
+                "segments": [{"start": 0, "end": 12}],
+                "export_padding": 0.75,
+            })
+
+        saved = self.store.get_project(self.video_id)
+        self.assertEqual(updated["editor"]["segments"], [{"start": 0, "end": 12}])
+        self.assertEqual(saved["editor"]["segments"], [{"start": 0, "end": 12}])
+        self.assertEqual(saved["editor"]["export_padding"], 0.75)
+        self.assertEqual(saved["editor"]["aspect_ratio"], "9:16")
+        self.assertEqual(saved["editor"]["selected"], [])
+        self.assertEqual(saved["updated_at"], "2026-10-17T12:00:00Z")
+
+    def test_update_editor_rejects_unknown_path_and_identity_fields(self):
+        self.create_project()
+        for patch_data in (
+            {"unknown": True},
+            {"source_path": "../../private.mp4"},
+            {"project_id": "c4548a12-1ac7-4a30-95d7-36460a4eb456"},
+            {"video_id": "c4548a12-1ac7-4a30-95d7-36460a4eb456"},
+        ):
+            with self.subTest(patch_data=patch_data):
+                with self.assertRaises(ValueError):
+                    self.store.update_editor(self.video_id, patch_data)
+
+        self.assertEqual(self.store.get_project(self.video_id)["editor"], {
+            "segments": [], "selected": [], "clip_results": [],
+            "subtitle_context": None, "subtitle_notice": "", "export_padding": 0.5,
+            "aspect_ratio": "9:16", "burn_subtitles": True, "insert_ad": False,
+            "text_ad_enabled": False, "text_ad_text": "", "text_ad_position": "top",
+            "text_ad_interval": 4, "text_ad_opacity": 0.75,
+            "video_banner_enabled": False, "video_banner_height": 380,
+        })
+
+    def test_list_projects_sorts_bounded_summaries_without_deleting_projects(self):
+        source = self.project_root / "backend" / "uploads" / "lesson.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"video")
+        project_ids = [str(uuid.UUID(int=index)) for index in range(1, 22)]
+        for project_id in project_ids:
+            self.create_project(video_id=project_id)
+
+        newest_id, middle_id, missing_id = project_ids[:3]
+        newest_file = self.store._project_dir(newest_id) / "project.json"
+        newest = json.loads(newest_file.read_text(encoding="utf-8"))
+        newest["updated_at"] = "2099-10-17T13:00:00Z"
+        newest["editor"]["clip_results"] = [{"clip": 1}, {"clip": 2}]
+        newest_file.write_text(json.dumps(newest), encoding="utf-8")
+        (self.store._project_dir(newest_id) / "transcript.json").write_text(
+            json.dumps({"full_text": "готово"}), encoding="utf-8"
+        )
+
+        middle_file = self.store._project_dir(middle_id) / "project.json"
+        middle = json.loads(middle_file.read_text(encoding="utf-8"))
+        middle["updated_at"] = "2099-10-17T12:00:00Z"
+        middle_file.write_text(json.dumps(middle), encoding="utf-8")
+        (self.store._project_dir(middle_id) / "checkpoint.json").write_text(json.dumps({
+            "schema_version": 1,
+            "operation_id": str(uuid.UUID(int=99)),
+            "operation_type": "transcription",
+            "video_id": middle_id,
+            "status": "stopped",
+            "progress_pct": 37,
+            "partial_result": {"checkpoint": 412.8},
+        }), encoding="utf-8")
+
+        missing_file = self.store._project_dir(missing_id) / "project.json"
+        missing = json.loads(missing_file.read_text(encoding="utf-8"))
+        missing["updated_at"] = "2099-10-17T11:00:00Z"
+        missing["source_path"] = "backend/uploads/missing.mp4"
+        missing_file.write_text(json.dumps(missing), encoding="utf-8")
+
+        listing = self.store.list_projects(limit=999)
+
+        self.assertEqual(len(listing["projects"]), 20)
+        self.assertEqual([item["project_id"] for item in listing["projects"][:3]], [
+            newest_id, middle_id, missing_id,
+        ])
+        self.assertTrue((self.store._project_dir(project_ids[-1]) / "project.json").exists())
+        self.assertEqual(listing["projects"][0], {
+            "project_id": newest_id,
+            "video_id": newest_id,
+            "title": "Занятие 1",
+            "filename": "lesson.mp4",
+            "updated_at": "2099-10-17T13:00:00Z",
+            "duration": 123.4,
+            "source_exists": True,
+            "has_transcript": True,
+            "clips_count": 2,
+            "transcription": None,
+        })
+        self.assertEqual(listing["projects"][1]["transcription"], {
+            "operation_id": str(uuid.UUID(int=99)),
+            "status": "stopped",
+            "progress_pct": 37,
+            "checkpoint": 412.8,
+        })
+        self.assertFalse(listing["projects"][2]["source_exists"])
+        self.assertEqual(self.store.source_status(newest_id), {
+            "exists": True,
+            "diagnostic": None,
+        })
+        self.assertEqual(self.store.source_status(missing_id), {
+            "exists": False,
+            "diagnostic": {
+                "code": "source_missing",
+                "message": "Исходный файл не найден",
+            },
+        })
+
+    def test_list_projects_skips_malformed_project_without_rewriting_it(self):
+        healthy_id = self.video_id
+        malformed_id = str(uuid.UUID(int=42))
+        self.create_project(video_id=healthy_id)
+        malformed_file = self.store._project_dir(malformed_id) / "project.json"
+        malformed_file.parent.mkdir(parents=True)
+        malformed_text = '{"schema_version": 1, broken'
+        malformed_file.write_text(malformed_text, encoding="utf-8")
+
+        listing = self.store.list_projects()
+
+        self.assertEqual([item["project_id"] for item in listing["projects"]], [healthy_id])
+        self.assertEqual(listing["diagnostics"], [{
+            "code": "project_unreadable",
+            "project_id": malformed_id,
+            "message": "invalid project JSON",
+        }])
+        self.assertEqual(malformed_file.read_text(encoding="utf-8"), malformed_text)
+
+    def test_list_projects_keeps_project_visible_when_checkpoint_is_malformed(self):
+        self.create_project()
+        checkpoint_file = self.store._project_dir(self.video_id) / "checkpoint.json"
+        malformed_text = '{"operation_id": broken'
+        checkpoint_file.write_text(malformed_text, encoding="utf-8")
+
+        listing = self.store.list_projects()
+
+        self.assertEqual(len(listing["projects"]), 1)
+        self.assertEqual(listing["projects"][0]["project_id"], self.video_id)
+        self.assertEqual(listing["projects"][0]["transcription"], {
+            "resume_available": False,
+            "diagnostic": {
+                "code": "checkpoint_unreadable",
+                "message": "Не удалось прочитать сохранённый прогресс",
+            },
+        })
+        self.assertEqual(listing["diagnostics"], [{
+            "code": "checkpoint_unreadable",
+            "project_id": self.video_id,
+            "message": "Не удалось прочитать сохранённый прогресс",
+        }])
+        self.assertEqual(checkpoint_file.read_text(encoding="utf-8"), malformed_text)
+
+    def test_unsupported_project_schema_is_reported_without_rewriting_project_or_checkpoint(self):
+        self.create_project()
+        project_file = self.store._project_dir(self.video_id) / "project.json"
+        checkpoint_file = self.store._project_dir(self.video_id) / "checkpoint.json"
+        project = json.loads(project_file.read_text(encoding="utf-8"))
+        project["schema_version"] = 2
+        project_file.write_text(json.dumps(project), encoding="utf-8")
+        checkpoint_file.write_text(json.dumps({"schema_version": 1, "status": "stopped"}), encoding="utf-8")
+        original_project = project_file.read_text(encoding="utf-8")
+        original_checkpoint = checkpoint_file.read_text(encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "unsupported project schema"):
+            self.store.get_project(self.video_id)
+        listing = self.store.list_projects()
+
+        self.assertEqual(listing, {
+            "projects": [],
+            "diagnostics": [{
+                "code": "project_schema_unsupported",
+                "project_id": self.video_id,
+                "message": "Неподдерживаемая версия проекта",
+            }],
+        })
+        self.assertEqual(project_file.read_text(encoding="utf-8"), original_project)
+        self.assertEqual(checkpoint_file.read_text(encoding="utf-8"), original_checkpoint)
+
+    def test_missing_source_reports_status_without_changing_project_or_checkpoint(self):
+        self.create_project(source_path="backend/uploads/missing.mp4")
+        project_file = self.store._project_dir(self.video_id) / "project.json"
+        checkpoint_file = self.store._project_dir(self.video_id) / "checkpoint.json"
+        checkpoint_file.write_text(json.dumps({"schema_version": 1, "status": "stopped"}), encoding="utf-8")
+        original_project = project_file.read_text(encoding="utf-8")
+        original_checkpoint = checkpoint_file.read_text(encoding="utf-8")
+
+        status = self.store.source_status(self.video_id)
+        listing = self.store.list_projects()
+
+        self.assertEqual(status["exists"], False)
+        self.assertFalse(listing["projects"][0]["source_exists"])
+        self.assertEqual(project_file.read_text(encoding="utf-8"), original_project)
+        self.assertEqual(checkpoint_file.read_text(encoding="utf-8"), original_checkpoint)
+
+    def test_checkpoint_and_final_transcript_round_trip_with_checkpoint_removal(self):
+        self.create_project()
+        checkpoint = {
+            "schema_version": 1,
+            "operation_id": str(uuid.UUID(int=88)),
+            "operation_type": "transcription",
+            "video_id": self.video_id,
+            "status": "stopped",
+            "progress_pct": 37,
+            "partial_result": {"checkpoint": 412.8, "segments": [{"text": "часть"}]},
+        }
+        transcript = {
+            "full_text": "Готовый текст",
+            "segments": [{"text": "Готовый текст"}],
+            "duration": 123.4,
+        }
+
+        saved_checkpoint = self.store.save_checkpoint(self.video_id, checkpoint)
+        loaded_checkpoint = self.store.load_checkpoint(self.video_id)
+        saved_transcript = self.store.save_transcript(self.video_id, transcript)
+        loaded_transcript = self.store.load_transcript(self.video_id)
+
+        self.assertEqual(saved_checkpoint, checkpoint)
+        self.assertEqual(loaded_checkpoint, checkpoint)
+        self.assertEqual(saved_transcript, transcript)
+        self.assertEqual(loaded_transcript, transcript)
+        self.assertTrue(self.store.remove_checkpoint(self.video_id))
+        self.assertIsNone(self.store.load_checkpoint(self.video_id))
+        self.assertFalse(self.store.remove_checkpoint(self.video_id))
+
+    def test_opening_project_copies_legacy_transcript_without_deleting_legacy_file(self):
+        legacy_dir = self.project_root / "backend" / "transcripts"
+        legacy_dir.mkdir(parents=True)
+        self.store = ProjectStore(self.project_root, legacy_transcripts_dir=legacy_dir)
+        self.create_project()
+        legacy_file = legacy_dir / f"{self.video_id}.json"
+        legacy_transcript = {"full_text": "Старый готовый текст", "segments": [{"text": "Старый"}]}
+        legacy_file.write_text(json.dumps(legacy_transcript, ensure_ascii=False), encoding="utf-8")
+
+        self.store.get_project(self.video_id)
+
+        copied_file = self.store._project_dir(self.video_id) / "transcript.json"
+        self.assertEqual(self.store.load_transcript(self.video_id), legacy_transcript)
+        self.assertEqual(json.loads(copied_file.read_text(encoding="utf-8")), legacy_transcript)
+        self.assertEqual(json.loads(legacy_file.read_text(encoding="utf-8")), legacy_transcript)
 
 
 if __name__ == "__main__":

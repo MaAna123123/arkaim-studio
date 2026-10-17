@@ -50,6 +50,10 @@ _VIDEO_SCALAR_FIELDS = frozenset({
 _CHAPTER_FIELDS = frozenset({"start_time", "end_time", "title", "index"})
 
 
+class UnsupportedProjectSchemaError(ValueError):
+    """A project record was written by a newer incompatible version."""
+
+
 class ProjectStore:
     """Owns all local filesystem access for version-one project records."""
 
@@ -207,6 +211,16 @@ class ProjectStore:
             raise ValueError("project JSON must contain an object")
         return data
 
+    @staticmethod
+    def _validate_project_schema(project: dict[str, Any]) -> None:
+        version = project.get("schema_version")
+        if not isinstance(version, int):
+            raise ValueError("project schema_version must be an integer")
+        if version > SCHEMA_VERSION:
+            raise UnsupportedProjectSchemaError("unsupported project schema")
+        if version != SCHEMA_VERSION:
+            raise ValueError("unsupported project schema")
+
     def create_project(
         self,
         video_id: str,
@@ -238,6 +252,7 @@ class ProjectStore:
         normalized_id = self._validate_id(project_id)
         with self._project_lock(normalized_id):
             project = self._read_json(self._project_dir(normalized_id) / "project.json")
+            self._validate_project_schema(project)
 
         source_path = project.get("source_path")
         try:
@@ -245,4 +260,229 @@ class ProjectStore:
         except (TypeError, ValueError):
             project.pop("source_path", None)
         project["video"] = self._safe_video_metadata(project.get("video"))
+        self.load_transcript(normalized_id)
         return project
+
+    def update_editor(self, project_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        """Apply an editor-only patch without permitting project identity changes."""
+        normalized_id = self._validate_id(project_id)
+        if not isinstance(updates, dict):
+            raise ValueError("editor updates must be an object")
+        unknown_fields = set(updates) - SUPPORTED_EDITOR_FIELDS
+        if unknown_fields:
+            raise ValueError("unsupported editor field")
+
+        destination = self._project_dir(normalized_id) / "project.json"
+        with self._project_lock(normalized_id):
+            project = self._read_json(destination)
+            self._validate_project_schema(project)
+            editor = project.get("editor")
+            if not isinstance(editor, dict):
+                editor = copy.deepcopy(DEFAULT_EDITOR)
+            else:
+                editor = {**copy.deepcopy(DEFAULT_EDITOR), **editor}
+            editor.update(copy.deepcopy(updates))
+            project["editor"] = editor
+            project["updated_at"] = self._utc_now()
+            self._atomic_write_json(destination, project)
+        return self.get_project(normalized_id)
+
+    def source_status(self, project_id: str) -> dict[str, Any]:
+        """Report whether a stored source path still resolves to a regular file."""
+        normalized_id = self._validate_id(project_id)
+        with self._project_lock(normalized_id):
+            project = self._read_json(self._project_dir(normalized_id) / "project.json")
+            self._validate_project_schema(project)
+        source_path = project.get("source_path")
+        try:
+            relative_path = self._relative_source_path(source_path)
+            exists = (self.project_root / relative_path).is_file()
+        except (TypeError, ValueError):
+            exists = False
+        return {
+            "exists": exists,
+            "diagnostic": None if exists else {
+                "code": "source_missing",
+                "message": "Исходный файл не найден",
+            },
+        }
+
+    @staticmethod
+    def _transcription_summary(checkpoint: Any) -> dict[str, Any] | None:
+        if not isinstance(checkpoint, dict):
+            return None
+        partial_result = checkpoint.get("partial_result")
+        if not isinstance(partial_result, dict):
+            partial_result = {}
+        return {
+            "operation_id": checkpoint.get("operation_id"),
+            "status": checkpoint.get("status"),
+            "progress_pct": checkpoint.get("progress_pct"),
+            "checkpoint": partial_result.get("checkpoint"),
+        }
+
+    def _project_summary(
+        self, project: dict[str, Any], project_directory: Path
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        project_id = self._validate_id(project.get("project_id"))
+        checkpoint_path = project_directory / "checkpoint.json"
+        checkpoint = None
+        checkpoint_diagnostic = None
+        if checkpoint_path.is_file():
+            try:
+                checkpoint = self._read_json(checkpoint_path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                checkpoint_diagnostic = {
+                    "code": "checkpoint_unreadable",
+                    "project_id": project_id,
+                    "message": "Не удалось прочитать сохранённый прогресс",
+                }
+        source_path = project.get("source_path")
+        try:
+            relative_path = self._relative_source_path(source_path)
+            source_exists = (self.project_root / relative_path).is_file()
+        except (TypeError, ValueError):
+            source_exists = False
+        editor = project.get("editor") if isinstance(project.get("editor"), dict) else {}
+        clip_results = editor.get("clip_results")
+        video = project.get("video") if isinstance(project.get("video"), dict) else {}
+        summary = {
+            "project_id": project_id,
+            "video_id": project.get("video_id"),
+            "title": project.get("title"),
+            "filename": self._source_filename(project.get("source_filename", "")),
+            "updated_at": project.get("updated_at"),
+            "duration": video.get("duration"),
+            "source_exists": source_exists,
+            "has_transcript": (project_directory / "transcript.json").is_file(),
+            "clips_count": len(clip_results) if isinstance(clip_results, list) else 0,
+            "transcription": (
+                {
+                    "resume_available": False,
+                    "diagnostic": {
+                        "code": checkpoint_diagnostic["code"],
+                        "message": checkpoint_diagnostic["message"],
+                    },
+                }
+                if checkpoint_diagnostic else self._transcription_summary(checkpoint)
+            ),
+        }
+        return summary, checkpoint_diagnostic
+
+    def list_projects(self, limit: int = 20) -> dict[str, Any]:
+        """Return bounded recent-project summaries without changing on-disk retention."""
+        try:
+            response_limit = int(limit)
+        except (TypeError, ValueError):
+            response_limit = 20
+        response_limit = max(1, min(response_limit, 20))
+        if not self.projects_root.is_dir():
+            return {"projects": [], "diagnostics": []}
+
+        projects = []
+        diagnostics = []
+        for project_directory in self.projects_root.iterdir():
+            if not project_directory.is_dir():
+                continue
+            try:
+                project_id = self._validate_id(project_directory.name)
+                with self._project_lock(project_id):
+                    project = self._read_json(project_directory / "project.json")
+                    self._validate_project_schema(project)
+                summary, checkpoint_diagnostic = self._project_summary(project, project_directory)
+                projects.append(summary)
+                if checkpoint_diagnostic:
+                    diagnostics.append(checkpoint_diagnostic)
+            except UnsupportedProjectSchemaError:
+                diagnostics.append({
+                    "code": "project_schema_unsupported",
+                    "project_id": project_directory.name,
+                    "message": "Неподдерживаемая версия проекта",
+                })
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                diagnostics.append({
+                    "code": "project_unreadable",
+                    "project_id": project_directory.name,
+                    "message": (
+                        "invalid project JSON"
+                        if isinstance(exc, json.JSONDecodeError)
+                        else "invalid project record"
+                    ),
+                })
+        projects.sort(key=lambda project: str(project.get("updated_at") or ""), reverse=True)
+        return {"projects": projects[:response_limit], "diagnostics": diagnostics}
+
+    def _require_project(self, project_id: str) -> tuple[str, Path]:
+        normalized_id = self._validate_id(project_id)
+        project_directory = self._project_dir(normalized_id)
+        project = self._read_json(project_directory / "project.json")
+        self._validate_project_schema(project)
+        return normalized_id, project_directory
+
+    def save_checkpoint(self, project_id: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        """Persist the complete recoverable transcription snapshot for a project."""
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint must be an object")
+        normalized_id = self._validate_id(project_id)
+        with self._project_lock(normalized_id):
+            _, project_directory = self._require_project(normalized_id)
+            saved = copy.deepcopy(checkpoint)
+            self._atomic_write_json(project_directory / "checkpoint.json", saved)
+        return saved
+
+    def load_checkpoint(self, project_id: str) -> dict[str, Any] | None:
+        """Load a saved snapshot, returning None only when no checkpoint exists."""
+        normalized_id = self._validate_id(project_id)
+        with self._project_lock(normalized_id):
+            _, project_directory = self._require_project(normalized_id)
+            destination = project_directory / "checkpoint.json"
+            if not destination.is_file():
+                return None
+            return self._read_json(destination)
+
+    def remove_checkpoint(self, project_id: str) -> bool:
+        """Remove an existing incomplete snapshot after final output is secured."""
+        normalized_id = self._validate_id(project_id)
+        with self._project_lock(normalized_id):
+            _, project_directory = self._require_project(normalized_id)
+            destination = project_directory / "checkpoint.json"
+            if not destination.is_file():
+                return False
+            destination.unlink()
+            return True
+
+    def save_transcript(self, project_id: str, transcript: dict[str, Any]) -> dict[str, Any]:
+        """Persist the completed transcript independently of incomplete state."""
+        if not isinstance(transcript, dict):
+            raise ValueError("transcript must be an object")
+        normalized_id = self._validate_id(project_id)
+        with self._project_lock(normalized_id):
+            _, project_directory = self._require_project(normalized_id)
+            saved = copy.deepcopy(transcript)
+            self._atomic_write_json(project_directory / "transcript.json", saved)
+        return saved
+
+    def load_transcript(self, project_id: str) -> dict[str, Any] | None:
+        """Load a completed transcript, copying a legacy result on first open."""
+        normalized_id = self._validate_id(project_id)
+        with self._project_lock(normalized_id):
+            _, project_directory = self._require_project(normalized_id)
+            destination = project_directory / "transcript.json"
+            if destination.is_file():
+                return self._read_json(destination)
+            if not self.legacy_transcripts_dir:
+                return None
+            legacy_destination = self.legacy_transcripts_dir / f"{normalized_id}.json"
+            try:
+                legacy_destination.resolve().relative_to(self.legacy_transcripts_dir.resolve())
+            except ValueError as exc:
+                raise ValueError("legacy transcript must stay below its configured directory") from exc
+            if not legacy_destination.is_file():
+                return None
+            with legacy_destination.open("r", encoding="utf-8") as transcript_file:
+                transcript = json.load(transcript_file)
+            if not isinstance(transcript, dict):
+                raise ValueError("legacy transcript JSON must contain an object")
+            copied = copy.deepcopy(transcript)
+            self._atomic_write_json(destination, copied)
+            return copied
