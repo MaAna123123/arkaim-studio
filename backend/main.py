@@ -26,10 +26,12 @@ try:
     from .subtitle_parser import parse_srt_bytes
     from .social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
     from .operation_manager import OperationConflictError, OperationManager
+    from .project_store import ProjectStore, UnsupportedProjectSchemaError
     from .transcription_service import TranscriptionService
     from .schemas import (
         AnalyzeRequest, AutoPipelineRequest, ExportRequest, SettingsRequest,
-        SocialPrepareRequest, SocialUploadRequest, TranscribeRequest, YoutubeUrlRequest,
+        ProjectEditorPatch, SocialPrepareRequest, SocialUploadRequest,
+        TranscribeRequest, YoutubeUrlRequest,
     )
     from .transcript_utils import (
         attach_transcript_text as _attach_transcript_text,
@@ -45,10 +47,12 @@ except ImportError:
     from subtitle_parser import parse_srt_bytes
     from social_uploader import youtube_uploader, instagram_uploader, tiktok_uploader
     from operation_manager import OperationConflictError, OperationManager
+    from project_store import ProjectStore, UnsupportedProjectSchemaError
     from transcription_service import TranscriptionService
     from schemas import (
         AnalyzeRequest, AutoPipelineRequest, ExportRequest, SettingsRequest,
-        SocialPrepareRequest, SocialUploadRequest, TranscribeRequest, YoutubeUrlRequest,
+        ProjectEditorPatch, SocialPrepareRequest, SocialUploadRequest,
+        TranscribeRequest, YoutubeUrlRequest,
     )
     from transcript_utils import (
         attach_transcript_text as _attach_transcript_text,
@@ -60,7 +64,8 @@ except ImportError:
 # ─────────────────────────────────────────────
 # Force ALL temp files & model caches to Drive X:
 # ─────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+BASE_DIR = PROJECT_ROOT
 TEMP_DIR = BASE_DIR / "temp"
 MODELS_DIR = BASE_DIR / "models_cache"
 
@@ -91,6 +96,7 @@ THUMBS_DIR = BACKEND_DIR / "thumbs"
 TRANSCRIPTS_DIR = BACKEND_DIR / "transcripts"
 ADS_DIR = BACKEND_DIR / "ads"
 BANNER_DIR = BACKEND_DIR / "banners"
+PROJECTS_DIR = PROJECT_ROOT / "data" / "projects"
 
 for d in [UPLOAD_DIR, CLIPS_DIR, THUMBS_DIR, TRANSCRIPTS_DIR, ADS_DIR, BANNER_DIR, TEMP_DIR, MODELS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -141,6 +147,10 @@ settings_store: dict = _load_settings()
 # поэтому модель загружается лениво — при старте сервера её ждать не надо.
 transcriber = VideoTranscriber(model_size=settings_store.get("whisper_model", "small"))
 operation_manager = OperationManager()
+project_store = ProjectStore(
+    PROJECT_ROOT,
+    legacy_transcripts_dir=TRANSCRIPTS_DIR,
+)
 active_connections: list[WebSocket] = []
 
 # ─────────────────────────────────────────────
@@ -161,7 +171,20 @@ transcription_service = TranscriptionService(
     operation_manager,
     transcriber,
     broadcast,
+    project_store,
 )
+
+
+@app.on_event("startup")
+async def recover_transcription_operations():
+    """Restore saved operations as stopped without scheduling Whisper work."""
+    try:
+        recovered = transcription_service.recover_projects()
+    except (OSError, ValueError, json.JSONDecodeError):
+        logger.exception("Не удалось восстановить сохранённые транскрипции")
+        return
+    if recovered:
+        logger.info("Восстановлено операций транскрипции: %d", len(recovered))
 
 
 @app.on_event("shutdown")
@@ -187,6 +210,151 @@ async def ws_progress(websocket: WebSocket):
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "ffmpeg": processor.check_ffmpeg()}
+
+
+def _normalize_project_id(project_id: str) -> str:
+    try:
+        return str(uuid.UUID(project_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Некорректный идентификатор проекта",
+        ) from exc
+
+
+def _project_storage_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=404, detail="Проект не найден")
+    logger.exception("Не удалось прочитать проект", exc_info=exc)
+    return HTTPException(status_code=500, detail="Не удалось прочитать данные проекта")
+
+
+def _checkpoint_public_snapshot(project_id: str) -> dict | None:
+    operation = operation_manager.find_for_video(project_id, include_stopped=True)
+    if operation is not None:
+        return operation
+    try:
+        checkpoint = project_store.load_checkpoint(project_id)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {
+            "resume_available": False,
+            "diagnostic": {
+                "code": "checkpoint_unreadable",
+                "message": "Сохранённый прогресс нельзя продолжить",
+            },
+        }
+    if not isinstance(checkpoint, dict):
+        return None
+    return {
+        key: checkpoint.get(key)
+        for key in (
+            "operation_id", "operation_type", "video_id", "status",
+            "progress_pct", "message", "created_at", "updated_at",
+            "started_at", "finished_at", "eta_seconds", "error",
+            "pending_action", "partial_result", "language",
+        )
+    }
+
+
+def _public_project(project_id: str) -> dict:
+    project = project_store.get_project(project_id)
+    project.pop("source_path", None)
+    source = project_store.source_status(project_id)
+    transcript = project_store.load_transcript(project_id)
+    project.update(
+        source_exists=bool(source.get("exists")),
+        source_diagnostic=source.get("diagnostic"),
+        has_transcript=transcript is not None,
+        transcription=_checkpoint_public_snapshot(project_id),
+    )
+    return project
+
+
+@app.get("/api/projects")
+async def list_projects(limit: int = 20):
+    if not 1 <= limit <= 20:
+        raise HTTPException(status_code=400, detail="limit должен быть от 1 до 20")
+    try:
+        return project_store.list_projects(limit=limit)
+    except (OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str):
+    normalized_id = _normalize_project_id(project_id)
+    try:
+        return _public_project(normalized_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+
+@app.patch("/api/projects/{project_id}")
+async def patch_project(project_id: str, request: ProjectEditorPatch):
+    normalized_id = _normalize_project_id(project_id)
+    try:
+        project_store.get_project(normalized_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+    try:
+        updates = request.model_dump(exclude_unset=True)
+        project_store.update_editor(normalized_id, updates)
+        return _public_project(normalized_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (FileNotFoundError, OSError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+
+@app.post("/api/projects/{project_id}/transcription/restart")
+async def restart_project_transcription(project_id: str):
+    normalized_id = _normalize_project_id(project_id)
+    try:
+        project = project_store.get_project(normalized_id)
+        source = project_store.source_status(normalized_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+    if not source.get("exists"):
+        raise HTTPException(
+            status_code=409,
+            detail="Исходный файл проекта не найден; сохранённые данные не изменены",
+        )
+
+    existing = operation_manager.find_for_video(normalized_id, include_stopped=True)
+    if existing is not None and existing["status"] != "stopped":
+        raise HTTPException(
+            status_code=409,
+            detail="Текущая транскрипция ещё активна",
+        )
+
+    try:
+        if existing is not None:
+            operation_manager.transition(existing["operation_id"], "cancelled")
+        source_path = Path(project["source_path"])
+        if not source_path.is_absolute():
+            source_path = Path(project_store.project_root) / source_path
+        operation = transcription_service.start(
+            normalized_id,
+            str(source_path),
+            None,
+            TRANSCRIPTS_DIR / f"{normalized_id}.json",
+            asyncio.get_running_loop(),
+        )
+        project_store.remove_checkpoint(normalized_id)
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+    return JSONResponse(content=operation, status_code=202)
 
 @app.get("/api/settings")
 async def get_settings():
@@ -397,6 +565,81 @@ def _legacy_transcript_summary(transcript: dict) -> dict:
     }
 
 
+def _load_saved_transcript(video_id: str) -> dict | None:
+    """Prefer the canonical project transcript, retaining legacy-only records."""
+    try:
+        normalized_id = str(uuid.UUID(video_id))
+    except (AttributeError, TypeError, ValueError):
+        normalized_id = None
+
+    if normalized_id is not None:
+        try:
+            transcript = project_store.load_transcript(normalized_id)
+        except FileNotFoundError:
+            transcript = None
+        except (OSError, ValueError, json.JSONDecodeError,
+                UnsupportedProjectSchemaError) as exc:
+            raise _project_storage_error(exc) from exc
+        if transcript is not None:
+            return transcript
+
+    legacy_id = normalized_id or video_id
+    transcript_file = TRANSCRIPTS_DIR / f"{legacy_id}.json"
+    if not transcript_file.is_file():
+        return None
+    with transcript_file.open("r", encoding="utf-8") as transcript_stream:
+        return json.load(transcript_stream)
+
+
+def _save_project_transcript_if_present(video_id: str, transcript: dict) -> None:
+    """Persist canonical transcript data when this legacy video has a project."""
+    try:
+        normalized_id = str(uuid.UUID(video_id))
+    except (AttributeError, TypeError, ValueError):
+        return
+    try:
+        project_store.save_transcript(normalized_id, transcript)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+
+def _record_ingestion(
+    *,
+    video_id: str,
+    source_path: str | Path,
+    source_filename: str,
+    title: str,
+    metadata: dict,
+    source_info: dict | None = None,
+    transcript: dict | None = None,
+    editor: dict | None = None,
+) -> dict:
+    """Persist one successful ingestion after its source and metadata exist."""
+    source = Path(source_path)
+    if not source.is_file():
+        raise ValueError("Исходный файл не найден после загрузки")
+    if not isinstance(metadata, dict):
+        raise ValueError("Не удалось получить метаданные видео")
+
+    video = dict(source_info or {})
+    video.update(metadata)
+    project = project_store.create_project(
+        video_id,
+        title,
+        source_filename,
+        source,
+        video,
+    )
+    if transcript and transcript.get("has_transcript"):
+        project_store.save_transcript(video_id, transcript)
+    if editor:
+        project = project_store.update_editor(video_id, editor)
+    return project
+
+
 @app.post("/api/youtube/info")
 async def youtube_info(req: YoutubeUrlRequest):
     try:
@@ -513,10 +756,6 @@ async def youtube_auto(req: AutoPipelineRequest):
         transcript = await _resolve_transcript(
             req.url, video_id, video_path, info, transcript, progress
         )
-        if transcript.get("has_transcript"):
-            with open(TRANSCRIPTS_DIR / f"{video_id}.json", "w", encoding="utf-8") as f:
-                json.dump(transcript, f, ensure_ascii=False)
-
         # 4. Превью для таймлайна
         meta = await asyncio.to_thread(processor.extract_metadata, video_path)
         thumbs = await asyncio.to_thread(
@@ -573,6 +812,30 @@ async def youtube_auto(req: AutoPipelineRequest):
             span_pct=14,
         )
 
+        _record_ingestion(
+            video_id=video_id,
+            source_path=video_path,
+            source_filename=Path(video_path).name,
+            title=info.get("title", "YouTube video"),
+            metadata=meta,
+            source_info=info,
+            transcript=transcript,
+            editor={
+                "segments": segments,
+                "selected": list(range(len(segments))),
+                "clip_results": clips,
+                "export_padding": req.padding,
+                "aspect_ratio": req.aspect_ratio,
+                "burn_subtitles": req.burn_subtitles,
+                "insert_ad": req.insert_ad,
+                "text_ad_enabled": req.text_ad_enabled,
+                "text_ad_text": req.text_ad_text,
+                "text_ad_position": req.text_ad_position,
+                "text_ad_interval": req.text_ad_interval,
+                "text_ad_opacity": req.text_ad_opacity,
+            },
+        )
+
         await progress(f"Готово — {len(clips)} клипов!", 100, "done")
 
         return {
@@ -613,10 +876,6 @@ async def youtube_download(req: YoutubeUrlRequest):
         transcript = await asyncio.to_thread(get_youtube_transcript, info)
         instant_clips = get_instant_clips(info, transcript)
 
-        if transcript and transcript.get("has_transcript"):
-            with open(TRANSCRIPTS_DIR / f"{video_id}.json", "w", encoding="utf-8") as f:
-                json.dump(transcript, f, ensure_ascii=False, indent=2)
-
         await broadcast({"type": "progress", "step": "downloading", "pct": 30, "msg": "Загрузка видеофайла с YouTube..."})
 
         loop = asyncio.get_running_loop()
@@ -638,6 +897,17 @@ async def youtube_download(req: YoutubeUrlRequest):
         meta = await asyncio.to_thread(processor.extract_metadata, str(target_path))
         thumbs = await asyncio.to_thread(
             processor.extract_thumbnails, str(target_path), str(THUMBS_DIR), video_id, 20
+        )
+
+        _record_ingestion(
+            video_id=video_id,
+            source_path=target_path,
+            source_filename=info.get("title", "YouTube video") + target_path.suffix,
+            title=info.get("title", "YouTube video"),
+            metadata=meta,
+            source_info=info,
+            transcript=transcript,
+            editor={"segments": instant_clips},
         )
 
         await broadcast({"type": "progress", "step": "done", "pct": 100, "msg": "Видео готово!"})
@@ -684,6 +954,14 @@ async def upload_video(file: UploadFile = File(...)):
     finally:
         await file.close()
 
+    _record_ingestion(
+        video_id=video_id,
+        source_path=video_path,
+        source_filename=file.filename or video_path.name,
+        title=Path(file.filename or video_path.name).stem,
+        metadata=meta,
+    )
+
     return {
         "video_id": video_id,
         "filename": file.filename,
@@ -703,9 +981,9 @@ async def transcribe_video(req: TranscribeRequest):
         raise HTTPException(status_code=404, detail="Video not found")
 
     transcript_file = TRANSCRIPTS_DIR / f"{req.video_id}.json"
-    if transcript_file.exists():
-        with open(transcript_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+    transcript = _load_saved_transcript(req.video_id)
+    if transcript is not None:
+        return transcript
 
     existing = operation_manager.find_for_video(req.video_id, include_stopped=True)
     operation = transcription_service.start(
@@ -715,9 +993,10 @@ async def transcribe_video(req: TranscribeRequest):
         transcript_file,
         asyncio.get_running_loop(),
     )
-    if operation["status"] == "completed" and transcript_file.exists():
-        with open(transcript_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+    if operation["status"] == "completed":
+        transcript = _load_saved_transcript(req.video_id)
+        if transcript is not None:
+            return transcript
     return JSONResponse(
         content=operation,
         status_code=200 if existing is not None else 202,
@@ -786,6 +1065,8 @@ async def import_transcript(video_id: str = Form(...), file: UploadFile = File(.
         data = parse_srt_bytes(content, file.filename or "subtitles.srt")
         is_chapter_map = data.get("transcript_kind") == "chapters"
         target_suffix = ".chapters.json" if is_chapter_map else ".json"
+        if not is_chapter_map:
+            _save_project_transcript_if_present(video_id, data)
         transcript_file = TRANSCRIPTS_DIR / f"{video_id}{target_suffix}"
         with open(transcript_file, "w", encoding="utf-8") as output:
             json.dump(data, output, ensure_ascii=False, indent=2)
@@ -799,13 +1080,11 @@ async def import_transcript(video_id: str = Form(...), file: UploadFile = File(.
 
 @app.get("/api/video/transcript/{video_id}")
 async def get_transcript(video_id: str):
-    transcript_file = TRANSCRIPTS_DIR / f"{video_id}.json"
-    if not transcript_file.exists():
+    data = _load_saved_transcript(video_id)
+    if data is None:
         return {"has_transcript": False}
-    with open(transcript_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        data["has_transcript"] = True
-        return data
+    data["has_transcript"] = True
+    return data
 
 # ─────────────────────────────────────────────
 # Analyze

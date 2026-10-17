@@ -15,6 +15,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 import main  # noqa: E402
 from operation_manager import OperationManager  # noqa: E402
+from project_store import ProjectStore  # noqa: E402
 
 
 class FakeTranscriptionService:
@@ -207,6 +208,127 @@ class OperationWebSocketPayloadTests(unittest.IsolatedAsyncioTestCase):
             main.active_connections[:] = previous
 
         self.assertEqual(socket.messages[0]["operation_id"], "operation-123")
+
+
+class ProjectTranscriptApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(dir=main.TEMP_DIR)
+        self.project_root = Path(self.temp_dir.name)
+        self.transcripts = self.project_root / "backend" / "transcripts"
+        self.transcripts.mkdir(parents=True)
+        self.store = ProjectStore(
+            self.project_root,
+            legacy_transcripts_dir=self.transcripts,
+        )
+        self.project_id = "02afe1b0-c9e0-4746-861f-b06006bd6af0"
+        self.source = (
+            self.project_root / "backend" / "uploads" / f"{self.project_id}.mp4"
+        )
+        self.source.parent.mkdir(parents=True)
+        self.source.write_bytes(b"video")
+        self.store.create_project(
+            self.project_id,
+            "Transcript lesson",
+            self.source.name,
+            self.source,
+            {"duration": 75},
+        )
+        self.manager = OperationManager()
+        self.service = FakeTranscriptionService(self.manager)
+        self.patchers = [
+            patch.object(main, "project_store", self.store),
+            patch.object(main, "operation_manager", self.manager),
+            patch.object(main, "transcription_service", self.service),
+            patch.object(main, "_find_video", return_value=str(self.source)),
+            patch.object(main, "TRANSCRIPTS_DIR", self.transcripts),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+        self.client = TestClient(main.app)
+
+    def tearDown(self):
+        self.client.close()
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_project_final_transcript_wins_over_stale_checkpoint(self):
+        self.store.save_transcript(
+            self.project_id,
+            {"full_text": "готовый проектный текст", "segments": [], "words": []},
+        )
+        self.store.save_checkpoint(
+            self.project_id,
+            {
+                "schema_version": 1,
+                "operation_id": "a3e55f84-538c-4db7-bc61-5607953fa9a2",
+                "operation_type": "transcription",
+                "video_id": self.project_id,
+                "status": "stopped",
+                "progress_pct": 37,
+                "partial_result": {"checkpoint": 33.0, "full_text": "устаревший"},
+            },
+        )
+
+        response = self.client.get(f"/api/video/transcript/{self.project_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["full_text"], "готовый проектный текст")
+        self.assertTrue(response.json()["has_transcript"])
+        self.assertNotIn("checkpoint", response.json())
+
+    def test_transcribe_returns_project_local_final_transcript_without_starting_operation(self):
+        self.store.save_transcript(
+            self.project_id,
+            {"full_text": "готовый проектный текст", "segments": [], "words": []},
+        )
+
+        response = self.client.post(
+            "/api/video/transcribe", json={"video_id": self.project_id}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["full_text"], "готовый проектный текст")
+        self.assertEqual(self.manager.list_operations(), [])
+
+    def test_import_saves_project_transcript_without_removing_legacy_copy(self):
+        response = self.client.post(
+            "/api/video/transcript/import",
+            data={"video_id": self.project_id},
+            files={
+                "file": (
+                    "lesson.srt",
+                    b"1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+                    "application/x-subrip",
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(
+            (self.store.projects_root / self.project_id / "transcript.json").is_file()
+        )
+        self.assertTrue((self.transcripts / f"{self.project_id}.json").is_file())
+
+    def test_legacy_transcript_fallback_is_migrated_without_deleting_legacy_file(self):
+        legacy_path = self.transcripts / f"{self.project_id}.json"
+        legacy = {"full_text": "старый текст", "segments": [], "words": []}
+        legacy_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+        response = self.client.get(f"/api/video/transcript/{self.project_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["full_text"], "старый текст")
+        self.assertTrue(response.json()["has_transcript"])
+        self.assertTrue(legacy_path.is_file())
+        canonical_path = (
+            self.store.projects_root / self.project_id / "transcript.json"
+        )
+        self.assertTrue(canonical_path.is_file())
+        self.assertEqual(
+            json.loads(canonical_path.read_text(encoding="utf-8"))["full_text"],
+            "старый текст",
+        )
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """HTTP request schemas shared by the API routes."""
 
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class AnalyzeRequest(BaseModel):
@@ -80,3 +80,26 @@ class SocialPrepareRequest(BaseModel):
 class TranscribeRequest(BaseModel):
     video_id: str
     language: Optional[str] = None
+
+
+class ProjectEditorPatch(BaseModel):
+    """Allow-listed editor state; project/runtime identity is never client-settable."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    segments: Any | None = None
+    selected: Any | None = None
+    clip_results: Any | None = None
+    subtitle_context: Any | None = None
+    subtitle_notice: Any | None = None
+    export_padding: Any | None = None
+    aspect_ratio: Any | None = None
+    burn_subtitles: Any | None = None
+    insert_ad: Any | None = None
+    text_ad_enabled: Any | None = None
+    text_ad_text: Any | None = None
+    text_ad_position: Any | None = None
+    text_ad_interval: Any | None = None
+    text_ad_opacity: Any | None = None
+    video_banner_enabled: Any | None = None
+    video_banner_height: Any | None = None
