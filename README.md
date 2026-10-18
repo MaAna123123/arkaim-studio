@@ -121,4 +121,3 @@ videopril/
 ## 🛠 Технологии
 - **Backend:** Python 3.12 · FastAPI · FFmpeg · Google Gemini AI
 - **Frontend:** React 19 · Vite · Vanilla CSS (Glassmorphism)
-- **ИИ:** Google Gemini 2.0 Flash (бесплатный тариф) / OpenCV fallback
