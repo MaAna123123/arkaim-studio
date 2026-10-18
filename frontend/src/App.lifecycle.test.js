@@ -204,6 +204,9 @@ function createTransport() {
     if (parsed.pathname === '/api/video/upload') {
       return request.promise;
     }
+    if (parsed.pathname === '/api/banner/upload') {
+      return request.promise;
+    }
     if (parsed.pathname.startsWith('/api/video/transcript/')) {
       return Promise.resolve(response({ has_transcript: false }));
     }
@@ -539,6 +542,55 @@ test('mounted App only autosaves an editor change after 700ms and cancels pendin
   });
   await browser.advanceTimers(700);
   assert.equal(transport.requestsFor('/api/projects/project-b', 'PATCH').length, 0, 'unmount must cancel an unsent autosave');
+});
+
+test('mounted App automatically enables a freshly uploaded video banner for the next export', async (t) => {
+  const { renderer, transport } = await mountApp(t);
+
+  await answerLatestHealth(transport, true);
+  await answerRecentProjects(transport, [recentProject('project-a', 'Banner A')]);
+  await act(async () => {
+    buttonByText(renderer, 'Открыть').props.onClick();
+    await flush();
+  });
+  await answerDetail(transport.detailRequests('project-a').at(-1), project('project-a', 'Banner A'));
+
+  const bannerInput = renderer.root.findAllByType('input').filter((input) => (
+    input.props.type === 'file'
+      && String(input.props.accept).includes('.webm')
+      && typeof input.props.onChange === 'function'
+  )).at(-1);
+  assert.ok(bannerInput, 'the banner manager should expose its video upload input');
+
+  await act(async () => {
+    bannerInput.props.onChange({
+      target: { files: [new File(['banner'], 'banner.mp4', { type: 'video/mp4' })] },
+    });
+    await flush();
+  });
+  const upload = transport.requestsFor('/api/banner/upload', 'POST')[0];
+  assert.ok(upload, 'a selected banner should be uploaded');
+  await answerDetail(upload, {
+    success: true,
+    filename: 'banner.mp4',
+    url: '/banners/current_banner.mp4',
+    duration: 4,
+    size_bytes: 6,
+  });
+
+  assert.match(
+    renderer.root.findByProps({ id: 'btn-toggle-video-banner' }).children.join(''),
+    /ВКЛ/,
+    'successful upload should enable the banner without requiring a second hidden action',
+  );
+
+  await act(async () => {
+    renderer.root.findByProps({ id: 'btn-export-separate' }).props.onClick();
+    await flush();
+  });
+  const exportRequest = transport.requestsFor('/api/video/export', 'POST')[0];
+  assert.ok(exportRequest, 'the export action should call the backend');
+  assert.equal(JSON.parse(exportRequest.options.body).video_banner_enabled, true);
 });
 
 test('mounted recent-project navigation aborts A autosave and a late A failure cannot affect B', async (t) => {
