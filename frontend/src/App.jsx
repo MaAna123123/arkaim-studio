@@ -148,6 +148,15 @@ export default function App() {
   const autosaveRequestRef = useRef(null);
   const autosaveSchedulerRef = useRef(null);
   const projectLifecycleRef = useRef(null);
+  const restoreCandidateRef = useRef(
+    restoredSession.video?.video_id
+      ? {
+          initialAttemptStarted: false,
+          projectId: restoredSession.video.video_id,
+          retryable: false,
+        }
+      : null,
+  );
   selectedVideoIdRef.current = video?.video_id;
 
   if (autosaveSchedulerRef.current === null) {
@@ -315,11 +324,30 @@ export default function App() {
   }, [projectLifecycle, serverOnline, Boolean(video), recentProjectsRevision]);
 
   useEffect(() => {
-    const restoredProjectId = restoredSession.video?.video_id;
-    if (!serverOnline || !restoredProjectId) return undefined;
-    projectLifecycle.loadProject(restoredProjectId, { origin: 'restore' });
-    return () => projectLifecycle.cancelDetail();
-  }, [projectLifecycle, restoredSession.video?.video_id, serverOnline]);
+    const candidate = restoreCandidateRef.current;
+    if (
+      !serverOnline
+      || !candidate
+      || (candidate.initialAttemptStarted && !candidate.retryable)
+    ) return undefined;
+
+    candidate.initialAttemptStarted = true;
+    candidate.retryable = false;
+    let cancelled = false;
+    projectLifecycle.loadProject(candidate.projectId, { origin: 'restore' })
+      .then((project) => {
+        if (cancelled || restoreCandidateRef.current !== candidate) return;
+        if (project) {
+          restoreCandidateRef.current = null;
+        } else {
+          candidate.retryable = true;
+        }
+      });
+    return () => {
+      cancelled = true;
+      projectLifecycle.cancelDetail();
+    };
+  }, [projectLifecycle, serverOnline]);
 
   useEffect(() => {
     if (!hydratedOperation || hydratedOperation.video_id !== video?.video_id) return undefined;
@@ -499,6 +527,7 @@ export default function App() {
   const hydrateRecentProject = async (project, { resume = false } = {}) => {
     const projectId = project?.project_id;
     if (!projectId) return;
+    restoreCandidateRef.current = null;
     setProjectError('');
     await projectLifecycle.loadProject(projectId, { resume });
   };
@@ -511,6 +540,7 @@ export default function App() {
   };
 
   const handleVideoReady = (videoData, localFileUrl = null) => {
+    restoreCandidateRef.current = null;
     projectLifecycle.cancelAll();
     pendingResumeOperationIdRef.current = null;
     projectLifecycle.adoptHydratedProject(videoData.video_id);
@@ -572,6 +602,7 @@ export default function App() {
   };
 
   const handleResetVideo = () => {
+    restoreCandidateRef.current = null;
     projectLifecycle.cancelAll();
     pendingResumeOperationIdRef.current = null;
     setCurrentProjectId(null);
