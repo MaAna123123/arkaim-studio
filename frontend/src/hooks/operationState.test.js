@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   canApplyOperationSnapshot,
+  claimRecoveredOperation,
   formatEta,
   getOperationActions,
   isUnfinishedTranscription,
@@ -77,6 +78,42 @@ test('a trusted start response can replace a failed operation', () => {
   assert.equal(
     canApplyOperationSnapshot(retry, failed, 'video-1', { claim: true }),
     true,
+  );
+});
+
+test('a recovered operation is explicitly claimed only for its matching video and id', () => {
+  const recovered = {
+    operation_id: 'recovered-op',
+    operation_type: 'transcription',
+    video_id: 'video-1',
+    status: 'stopped',
+  };
+
+  assert.equal(
+    claimRecoveredOperation(recovered, 'recovered-op', 'video-1', ''),
+    recovered,
+  );
+  assert.equal(
+    claimRecoveredOperation(recovered, 'recovered-op', 'stale-video', ''),
+    null,
+  );
+  assert.equal(
+    claimRecoveredOperation(recovered, 'different-op', 'video-1', ''),
+    null,
+  );
+});
+
+test('a pending operation action suppresses a duplicate recovered resume claim', () => {
+  const recovered = {
+    operation_id: 'recovered-op',
+    operation_type: 'transcription',
+    video_id: 'video-1',
+    status: 'stopped',
+  };
+
+  assert.equal(
+    claimRecoveredOperation(recovered, 'recovered-op', 'video-1', 'resume'),
+    null,
   );
 });
 

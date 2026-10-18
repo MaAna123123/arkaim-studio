@@ -14,8 +14,16 @@ import SettingsModal from './components/SettingsModal';
 import AdManager from './components/AdManager';
 import SocialSharePanel from './components/SocialSharePanel';
 import OperationPanel from './components/OperationPanel';
+import RecentProjects from './components/RecentProjects';
 import useOperation, { isUnfinishedTranscription } from './hooks/useOperation';
-import { clearSession, loadSession, saveSession } from './lib/sessionStorage';
+import { mapProjectToEditorState } from './lib/projectState';
+import {
+  buildHydratedProjectVideo,
+  clearSession,
+  createProjectAutosaveScheduler,
+  loadSession,
+  saveSession,
+} from './lib/sessionStorage';
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 const SESSION_KEY = 'videopril.session.v1';
@@ -26,6 +34,23 @@ function loadStoredSession() {
     return {};
   }
   return loadSession(window.sessionStorage);
+}
+
+function recoveredOperationForProject(project) {
+  const snapshot = project?.transcription;
+  const videoId = project?.video_id ?? project?.project_id;
+  if (!snapshot?.operation_id || !videoId) return null;
+  return {
+    ...snapshot,
+    operation_type: 'transcription',
+    video_id: videoId,
+  };
+}
+
+function diagnosticMessage(diagnostic, fallback) {
+  return typeof diagnostic?.message === 'string' && diagnostic.message
+    ? diagnostic.message
+    : fallback;
 }
 
 function apiUrl(path) {
@@ -58,6 +83,13 @@ export default function App() {
   // ── State ──────────────────────────────────────────────────────────────────
   const [serverOnline, setServerOnline] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [recentProjects, setRecentProjects] = useState([]);
+  const [projectDiagnostics, setProjectDiagnostics] = useState([]);
+  const [projectError, setProjectError] = useState('');
+  const [projectPendingAction, setProjectPendingAction] = useState(null);
+  const [currentProjectId, setCurrentProjectId] = useState(null);
+  const [hydratedOperation, setHydratedOperation] = useState(null);
+  const [recentProjectsRevision, setRecentProjectsRevision] = useState(0);
 
   const [inputTab, setInputTab] = useState('url'); // 'file' | 'url'
 
@@ -104,7 +136,22 @@ export default function App() {
   const subtitleInputRef = useRef(null);
   const afterChapterImportRef = useRef(false);
   const selectedVideoIdRef = useRef(video?.video_id);
+  const hydratedProjectIdRef = useRef(null);
+  const pendingResumeOperationIdRef = useRef(null);
+  const projectLoadGenerationRef = useRef(0);
+  const projectLoadControllerRef = useRef(null);
+  const autosaveGenerationRef = useRef(0);
+  const autosaveControllerRef = useRef(null);
+  const autosaveRequestRef = useRef(null);
+  const autosaveSchedulerRef = useRef(null);
+  const restoredProjectAttemptRef = useRef(false);
   selectedVideoIdRef.current = video?.video_id;
+
+  if (autosaveSchedulerRef.current === null) {
+    autosaveSchedulerRef.current = createProjectAutosaveScheduler({
+      save: (projectId, payload) => autosaveRequestRef.current?.(projectId, payload),
+    });
+  }
 
   const handleTranscriptionCompleted = useCallback(async (directTranscript = null) => {
     if (!video?.video_id) return;
@@ -133,9 +180,11 @@ export default function App() {
     operation: transcriptionOperation,
     error: operationError,
     pendingAction: operationPendingAction,
+    adopt: adoptTranscriptionOperation,
     start: startTranscription,
     pause: pauseTranscription,
     resume: resumeTranscription,
+    resumeOperation,
     stop: stopTranscription,
   } = useOperation({
     apiBase: API,
@@ -143,6 +192,183 @@ export default function App() {
     onCompleted: handleTranscriptionCompleted,
   });
   const transcribing = isUnfinishedTranscription(transcriptionOperation);
+
+  const cancelProjectAutosave = useCallback(() => {
+    autosaveGenerationRef.current += 1;
+    autosaveSchedulerRef.current?.cancel();
+    autosaveControllerRef.current?.abort();
+    autosaveControllerRef.current = null;
+  }, []);
+
+  const cancelProjectLoad = useCallback(() => {
+    projectLoadGenerationRef.current += 1;
+    projectLoadControllerRef.current?.abort();
+    projectLoadControllerRef.current = null;
+  }, []);
+
+  autosaveRequestRef.current = async (projectId, payload) => {
+    const generation = autosaveGenerationRef.current;
+    const controller = new AbortController();
+    autosaveControllerRef.current?.abort();
+    autosaveControllerRef.current = controller;
+    try {
+      const response = await fetch(`${API}/api/projects/${projectId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      await readApiResponse(response);
+    } catch (saveError) {
+      if (saveError.name !== 'AbortError' && generation === autosaveGenerationRef.current) {
+        setProjectError(`Не удалось сохранить проект: ${saveError.message}`);
+      }
+    } finally {
+      if (autosaveControllerRef.current === controller) autosaveControllerRef.current = null;
+    }
+  };
+
+  const applyProjectDetails = useCallback((project, { resumeOperationId = null } = {}) => {
+    const mapped = mapProjectToEditorState(project);
+    const hydratedVideo = buildHydratedProjectVideo(project, mapped.video);
+    cancelProjectAutosave();
+    hydratedProjectIdRef.current = null;
+    pendingResumeOperationIdRef.current = resumeOperationId;
+
+    setVideo(hydratedVideo);
+    setVideoUrl(apiUrl(hydratedVideo?.video_url));
+    setTranscript(mapped.transcript);
+    setSubtitleContext(mapped.subtitleContext);
+    setSubtitleNotice(mapped.subtitleNotice);
+    setSegments(mapped.segments);
+    setSelected(mapped.selected);
+    setClipResults(mapped.clipResults);
+    setExportPadding(mapped.exportPadding);
+    setAspectRatio(mapped.aspectRatio);
+    setBurnSubtitles(mapped.burnSubtitles);
+    setInsertAd(mapped.insertAd);
+    setTextAdEnabled(mapped.textAdEnabled);
+    setTextAdText(mapped.textAdText);
+    setTextAdPosition(mapped.textAdPosition);
+    setTextAdInterval(mapped.textAdInterval);
+    setTextAdOpacity(mapped.textAdOpacity);
+    setVideoBannerEnabled(mapped.videoBannerEnabled);
+    setVideoBannerHeight(mapped.videoBannerHeight);
+    setEditingIdx(null);
+    setPlayerTime(0);
+    setPlayerSeekTo(null);
+    setProgress({ pct: 0, msg: '', step: '' });
+    setHydratedOperation(recoveredOperationForProject(project));
+    setCurrentProjectId(mapped.projectId);
+    hydratedProjectIdRef.current = mapped.projectId;
+
+    const checkpointDiagnostic = project?.transcription?.diagnostic;
+    setProjectError(checkpointDiagnostic
+      ? diagnosticMessage(checkpointDiagnostic, 'Сохранённый прогресс нельзя продолжить')
+      : '');
+  }, [cancelProjectAutosave]);
+
+  const loadProjectDetails = useCallback(async (projectId) => {
+    cancelProjectLoad();
+    cancelProjectAutosave();
+    hydratedProjectIdRef.current = null;
+    const generation = projectLoadGenerationRef.current;
+    const controller = new AbortController();
+    projectLoadControllerRef.current = controller;
+    try {
+      const response = await fetch(`${API}/api/projects/${projectId}`, {
+        signal: controller.signal,
+      });
+      const project = await readApiResponse(response);
+      if (generation !== projectLoadGenerationRef.current) return null;
+      return project;
+    } finally {
+      if (projectLoadControllerRef.current === controller) projectLoadControllerRef.current = null;
+    }
+  }, [cancelProjectAutosave, cancelProjectLoad]);
+
+  useEffect(() => {
+    if (!serverOnline) return undefined;
+    const controller = new AbortController();
+    const fetchRecentProjects = async () => {
+      try {
+        const response = await fetch(`${API}/api/projects?limit=20`, {
+          signal: controller.signal,
+        });
+        const data = await readApiResponse(response);
+        setRecentProjects(Array.isArray(data?.projects) ? data.projects : []);
+        setProjectDiagnostics(Array.isArray(data?.diagnostics) ? data.diagnostics : []);
+      } catch (listError) {
+        if (listError.name !== 'AbortError') {
+          setProjectError(`Не удалось загрузить проекты: ${listError.message}`);
+        }
+      }
+    };
+    fetchRecentProjects();
+    return () => controller.abort();
+  }, [serverOnline, recentProjectsRevision]);
+
+  useEffect(() => {
+    const restoredProjectId = restoredSession.video?.video_id;
+    if (!serverOnline || !restoredProjectId || restoredProjectAttemptRef.current) return undefined;
+    restoredProjectAttemptRef.current = true;
+    let disposed = false;
+    loadProjectDetails(restoredProjectId)
+      .then((project) => {
+        if (disposed || !project) return;
+        if (project.source_exists === false) {
+          setVideo(null);
+          setVideoUrl(null);
+          setProjectError(diagnosticMessage(
+            project.source_diagnostic,
+            'Исходный файл проекта не найден',
+          ));
+          return;
+        }
+        applyProjectDetails(project);
+      })
+      .catch((loadError) => {
+        if (!disposed && loadError.name !== 'AbortError') {
+          setVideo(null);
+          setVideoUrl(null);
+          setProjectError(`Не удалось восстановить проект: ${loadError.message}`);
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [applyProjectDetails, loadProjectDetails, restoredSession.video?.video_id, serverOnline]);
+
+  useEffect(() => {
+    if (!hydratedOperation || hydratedOperation.video_id !== video?.video_id) return undefined;
+    const adopted = adoptTranscriptionOperation(hydratedOperation);
+    const resumeId = pendingResumeOperationIdRef.current;
+    if (!resumeId) return undefined;
+    pendingResumeOperationIdRef.current = null;
+
+    if (!adopted || resumeId !== hydratedOperation.operation_id) {
+      setProjectError('Сохранённую операцию не удалось привязать к этому проекту');
+      setProjectPendingAction(null);
+      return undefined;
+    }
+
+    let disposed = false;
+    resumeOperation(resumeId)
+      .then((snapshot) => {
+        if (!disposed && !snapshot) {
+          setProjectError('Продолжение уже выполняется или сохранённая операция устарела');
+        }
+      })
+      .catch((resumeError) => {
+        if (!disposed && resumeError.name !== 'AbortError') setProjectError(resumeError.message);
+      })
+      .finally(() => {
+        if (!disposed) setProjectPendingAction(null);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [adoptTranscriptionOperation, hydratedOperation, resumeOperation, video?.video_id]);
 
   useEffect(() => {
     if (!video) {
@@ -152,6 +378,7 @@ export default function App() {
 
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify({
+        projectId: currentProjectId,
         video,
         subtitleContext,
         subtitleNotice,
@@ -169,7 +396,42 @@ export default function App() {
     } catch {
       // Session persistence is optional; the active editor must keep working.
     }
-  }, [video, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity]);
+  }, [currentProjectId, video, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity]);
+
+  useEffect(() => {
+    if (!serverOnline) {
+      autosaveSchedulerRef.current?.cancel();
+      return undefined;
+    }
+    autosaveSchedulerRef.current?.schedule({
+      projectId: currentProjectId,
+      hydratedProjectId: hydratedProjectIdRef.current,
+      editor: {
+        segments,
+        selected,
+        clipResults,
+        subtitleContext,
+        subtitleNotice,
+        exportPadding,
+        aspectRatio,
+        burnSubtitles,
+        insertAd,
+        textAdEnabled,
+        textAdText,
+        textAdPosition,
+        textAdInterval,
+        textAdOpacity,
+        videoBannerEnabled,
+        videoBannerHeight,
+      },
+    });
+    return () => autosaveSchedulerRef.current?.cancel();
+  }, [currentProjectId, serverOnline, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, burnSubtitles, insertAd, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity, videoBannerEnabled, videoBannerHeight]);
+
+  useEffect(() => () => {
+    cancelProjectLoad();
+    cancelProjectAutosave();
+  }, [cancelProjectAutosave, cancelProjectLoad]);
 
   // ── Server health ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -220,7 +482,13 @@ export default function App() {
   // If Whisper finished in the background (for example during AI analysis),
   // automatically reveal the selectable transcript without another upload.
   useEffect(() => {
-    if (!video || transcript?.has_transcript) return;
+    if (
+      !video
+      || (
+        transcript?.has_transcript
+        && (transcript.full_text || transcript.words?.length || transcript.segments?.length)
+      )
+    ) return;
     let cancelled = false;
 
     const loadReadyTranscript = async () => {
@@ -247,7 +515,77 @@ export default function App() {
   }, [video?.video_id, transcript?.has_transcript, analyzing, transcribing]);
 
   // ── Video loaded ───────────────────────────────────────────────────────────
+  const hydrateRecentProject = async (project, { resume = false } = {}) => {
+    const projectId = project?.project_id;
+    if (!projectId) return;
+    const action = resume ? 'resume' : 'open';
+    let resumeHandedOff = false;
+    setProjectPendingAction({ projectId, action });
+    setProjectError('');
+    try {
+      const detail = await loadProjectDetails(projectId);
+      if (!detail) return;
+      if (detail.source_exists === false) {
+        setProjectError(diagnosticMessage(
+          detail.source_diagnostic,
+          'Исходный файл проекта не найден; данные проекта сохранены',
+        ));
+        return;
+      }
+
+      if (resume) {
+        const operationId = detail.transcription?.operation_id;
+        if (!operationId || detail.transcription?.resume_available === false) {
+          setProjectError(diagnosticMessage(
+            detail.transcription?.diagnostic,
+            'Сохранённый прогресс нельзя продолжить',
+          ));
+          return;
+        }
+        resumeHandedOff = true;
+        applyProjectDetails(detail, { resumeOperationId: operationId });
+        return;
+      }
+
+      applyProjectDetails(detail);
+    } catch (loadError) {
+      if (loadError.name !== 'AbortError') setProjectError(loadError.message);
+    } finally {
+      if (!resumeHandedOff) setProjectPendingAction(null);
+    }
+  };
+
+  const handleRestartProject = async (project) => {
+    const projectId = project?.project_id;
+    if (!projectId) return;
+    setProjectPendingAction({ projectId, action: 'restart' });
+    setProjectError('');
+    try {
+      const response = await fetch(`${API}/api/projects/${projectId}/transcription/restart`, {
+        method: 'POST',
+      });
+      const snapshot = await readApiResponse(response);
+      setRecentProjects((projects) => projects.map((item) => (
+        item.project_id === projectId
+          ? { ...item, transcription: snapshot, has_transcript: false }
+          : item
+      )));
+    } catch (restartError) {
+      setProjectError(restartError.message);
+    } finally {
+      setProjectPendingAction(null);
+    }
+  };
+
   const handleVideoReady = (videoData, localFileUrl = null) => {
+    cancelProjectLoad();
+    cancelProjectAutosave();
+    pendingResumeOperationIdRef.current = null;
+    hydratedProjectIdRef.current = videoData.video_id;
+    setCurrentProjectId(videoData.video_id);
+    setHydratedOperation(null);
+    setProjectPendingAction(null);
+    setProjectError('');
     setVideo(videoData);
     setSegments([]);
     setSelected(new Set());
@@ -302,6 +640,13 @@ export default function App() {
   };
 
   const handleResetVideo = () => {
+    cancelProjectLoad();
+    cancelProjectAutosave();
+    hydratedProjectIdRef.current = null;
+    pendingResumeOperationIdRef.current = null;
+    setCurrentProjectId(null);
+    setHydratedOperation(null);
+    setProjectPendingAction(null);
     setVideo(null);
     setVideoUrl(null);
     setSegments([]);
@@ -311,6 +656,7 @@ export default function App() {
     setSubtitleContext(null);
     setSubtitleNotice('');
     clearSession(window.sessionStorage);
+    setRecentProjectsRevision((revision) => revision + 1);
   };
 
   // ── Transcribe (Whisper) ───────────────────────────────────────────────────
@@ -578,9 +924,35 @@ export default function App() {
 
       <main className="app-main" style={{ paddingTop: 32 }}>
 
+        {projectError && (
+          <div className="glass-card p-24" role="alert" style={{ marginBottom: 20 }}>
+            {projectError}
+          </div>
+        )}
+
         {/* ── Tabs for Input ────────────────────────────────────────────── */}
         {!video && (
           <section style={{ marginBottom: 28 }}>
+
+            {projectDiagnostics.map((diagnostic) => (
+              <div
+                className="glass-card p-24"
+                role="status"
+                key={`${diagnostic.project_id || 'project'}-${diagnostic.code || diagnostic.message}`}
+                style={{ marginBottom: 16 }}
+              >
+                {diagnosticMessage(diagnostic, 'Проект повреждён и не был изменён')}
+              </div>
+            ))}
+
+            <RecentProjects
+              projects={recentProjects}
+              pendingAction={projectPendingAction}
+              onOpen={(project) => hydrateRecentProject(project)}
+              onResume={(project) => hydrateRecentProject(project, { resume: true })}
+              onRestart={handleRestartProject}
+            />
+
             <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
               <button
                 id="btn-tab-url"

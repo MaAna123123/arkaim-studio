@@ -33,6 +33,13 @@ export function canApplyOperationSnapshot(
     && currentOperation.operation_id === snapshot.operation_id;
 }
 
+export function claimRecoveredOperation(snapshot, operationId, videoId, pendingAction = '') {
+  if (pendingAction || !operationId || snapshot?.operation_id !== operationId) return null;
+  return canApplyOperationSnapshot(snapshot, null, videoId, { claim: true })
+    ? snapshot
+    : null;
+}
+
 export function formatEta(value) {
   if (value === null || value === undefined || value === '') return '—';
   const seconds = Number(value);
@@ -64,6 +71,7 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
   const [socketConnected, setSocketConnected] = useState(false);
   const operationRef = useRef(null);
   const completedRef = useRef(null);
+  const pendingActionRef = useRef('');
   const generationRef = useRef(0);
   const requestControllersRef = useRef(new Set());
 
@@ -108,6 +116,12 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     }
   }, [apiBase, applySnapshot, videoId]);
 
+  const adopt = useCallback((snapshot) => applySnapshot(snapshot, {
+    claim: true,
+    generation: generationRef.current,
+    expectedVideo: videoId,
+  }), [applySnapshot, videoId]);
+
   useEffect(() => {
     generationRef.current += 1;
     const generation = generationRef.current;
@@ -115,6 +129,7 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     requestControllersRef.current.clear();
     operationRef.current = null;
     completedRef.current = null;
+    pendingActionRef.current = '';
     setOperation(null);
     setError('');
     setPendingAction('');
@@ -201,12 +216,13 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
   }, [operation?.operation_id, operation?.status, socketConnected, refresh]);
 
   const start = useCallback(async () => {
-    if (!videoId) return null;
+    if (!videoId || pendingActionRef.current) return null;
     const generation = generationRef.current;
     const expectedVideo = videoId;
     const controller = new AbortController();
     requestControllersRef.current.add(controller);
     setError('');
+    pendingActionRef.current = 'start';
     setPendingAction('start');
     try {
       const response = await fetch(`${apiBase}/api/video/transcribe`, {
@@ -230,18 +246,27 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
       throw startError;
     } finally {
       requestControllersRef.current.delete(controller);
-      if (generation === generationRef.current) setPendingAction('');
+      if (generation === generationRef.current && pendingActionRef.current === 'start') {
+        pendingActionRef.current = '';
+        setPendingAction('');
+      }
     }
   }, [apiBase, videoId, applySnapshot, onCompleted]);
 
-  const control = useCallback(async (action) => {
-    const operationId = operationRef.current?.operation_id;
-    if (!operationId) return null;
+  const control = useCallback(async (action, operationId = operationRef.current?.operation_id) => {
+    const current = operationRef.current;
+    if (
+      !operationId
+      || pendingActionRef.current
+      || current?.operation_id !== operationId
+      || current?.video_id !== videoId
+    ) return null;
     const generation = generationRef.current;
     const expectedVideo = videoId;
     const controller = new AbortController();
     requestControllersRef.current.add(controller);
     setError('');
+    pendingActionRef.current = action;
     setPendingAction(action);
     try {
       const response = await fetch(`${apiBase}/api/operations/${operationId}/${action}`, {
@@ -257,17 +282,38 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
       throw controlError;
     } finally {
       requestControllersRef.current.delete(controller);
-      if (generation === generationRef.current) setPendingAction('');
+      if (generation === generationRef.current && pendingActionRef.current === action) {
+        pendingActionRef.current = '';
+        setPendingAction('');
+      }
     }
   }, [apiBase, applySnapshot, videoId]);
+
+  const resumeOperation = useCallback((operationId = operationRef.current?.operation_id) => {
+    const recovered = claimRecoveredOperation(
+      operationRef.current,
+      operationId,
+      videoId,
+      pendingActionRef.current,
+    );
+    if (!recovered) return Promise.resolve(null);
+    applySnapshot(recovered, {
+      claim: true,
+      generation: generationRef.current,
+      expectedVideo: videoId,
+    });
+    return control('resume', operationId);
+  }, [applySnapshot, control, videoId]);
 
   return {
     operation,
     error,
     pendingAction,
+    adopt,
     start,
     pause: () => control('pause'),
-    resume: () => control('resume'),
+    resume: resumeOperation,
+    resumeOperation,
     stop: () => control('stop'),
     refresh,
   };
