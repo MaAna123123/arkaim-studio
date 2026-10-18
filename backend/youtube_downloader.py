@@ -27,8 +27,8 @@ _LANG_PRIORITY = ["ru", "ru-RU", "en", "en-US", "en-GB"]
 _FORMAT_PRIORITY = ["json3", "srv3", "srv2", "srv1", "vtt", "ttml"]
 
 
-def _get_ydl_opts(quiet: bool = True) -> dict:
-    return {
+def _get_ydl_opts(quiet: bool = True, url: str = "") -> dict:
+    options = {
         "quiet": quiet,
         "no_warnings": quiet,
         "extract_flat": False,
@@ -49,6 +49,14 @@ def _get_ydl_opts(quiet: bool = True) -> dict:
             ),
         },
     }
+    if "rutube.ru" in url.lower():
+        options.update({
+            "socket_timeout": 60,
+            "retries": 10,
+            "extractor_retries": 5,
+            "fragment_retries": 10,
+        })
+    return options
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +152,11 @@ def get_info(url: str) -> dict:
     except ImportError:
         raise RuntimeError("yt-dlp не установлен. Запустите: pip install yt-dlp")
 
-    opts = {**_get_ydl_opts(), "skip_download": True, "writesubtitles": True}
+    opts = {
+        **_get_ydl_opts(url=url),
+        "skip_download": True,
+        "writesubtitles": True,
+    }
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -246,7 +258,7 @@ def download(
                 progress_cb(f"Скачиваю видео: {mb_done:.1f} / {mb_total:.1f} МБ", pct)
 
     opts = {
-        **_get_ydl_opts(quiet=True),
+        **_get_ydl_opts(quiet=True, url=url),
         "format": fmt,
         "outtmpl": out_template,
         "progress_hooks": [progress_hook],
