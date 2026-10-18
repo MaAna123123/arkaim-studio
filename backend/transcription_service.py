@@ -39,6 +39,7 @@ class TranscriptionService:
         self._futures: dict[str, asyncio.Future] = {}
         self._video_operations: dict[tuple[str, str], str] = {}
         self._action_locks: dict[str, threading.Lock] = {}
+        self._video_action_locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
 
     def start(
@@ -110,6 +111,29 @@ class TranscriptionService:
         """
         if self.project_store is None:
             raise ValueError("Project storage is required for transcription restart")
+
+        with self._video_action_lock(video_id):
+            if self.project_store.load_transcript(video_id) is not None:
+                raise OperationConflictError("Completed transcript already exists")
+            return self._restart_from_zero_locked(
+                video_id,
+                video_path,
+                language,
+                transcript_path,
+                loop,
+                previous_operation_id,
+            )
+
+    def _restart_from_zero_locked(
+        self,
+        video_id: str,
+        video_path: str,
+        language: str | None,
+        transcript_path: Path,
+        loop: asyncio.AbstractEventLoop,
+        previous_operation_id: str | None = None,
+    ) -> dict:
+        """Commit a replacement while holding the project-wide action lock."""
 
         previous = None
         previous_metadata = None
@@ -599,51 +623,53 @@ class TranscriptionService:
             final_result = copy.deepcopy(result)
             final_result.pop("is_complete", None)
             final_result.pop("checkpoint", None)
-            with self._operation_action_lock(operation_id):
-                with self._lock:
-                    latest = self.manager.get(operation_id)
-                    if (
-                        not self._is_current_generation(operation_id, generation)
-                        or latest is None
-                        or latest["status"] != "running"
-                        or latest.get("pending_action")
-                    ):
-                        return
+            video_id = latest["video_id"]
+            with self._video_action_lock(video_id):
+                with self._operation_action_lock(operation_id):
+                    with self._lock:
+                        latest = self.manager.get(operation_id)
+                        if (
+                            not self._is_current_generation(operation_id, generation)
+                            or latest is None
+                            or latest["status"] != "running"
+                            or latest.get("pending_action")
+                        ):
+                            return
 
-                if self.project_store is not None:
-                    self.project_store.save_transcript(
-                        latest["video_id"], final_result
-                    )
-
-                with self._lock:
-                    latest = self.manager.get(operation_id)
-                    if (
-                        not self._is_current_generation(operation_id, generation)
-                        or latest is None
-                        or latest["status"] != "running"
-                        or latest.get("pending_action")
-                    ):
-                        return
-                    self._write_final_transcript(
-                        metadata["transcript_path"], operation_id, final_result
-                    )
-                    self.manager.update(
-                        operation_id,
-                        partial_result=final_result,
-                        progress_pct=100,
-                        message="Транскрипция завершена!",
-                        eta_seconds=0,
-                        pending_action=None,
-                    )
-                    self.manager.transition(operation_id, "completed")
-
-                if self.project_store is not None:
-                    try:
-                        self.project_store.remove_checkpoint(latest["video_id"])
-                    except OSError:
-                        logger.exception(
-                            "Final transcript saved but checkpoint cleanup failed"
+                    if self.project_store is not None:
+                        self.project_store.save_transcript(
+                            latest["video_id"], final_result
                         )
+
+                    with self._lock:
+                        latest = self.manager.get(operation_id)
+                        if (
+                            not self._is_current_generation(operation_id, generation)
+                            or latest is None
+                            or latest["status"] != "running"
+                            or latest.get("pending_action")
+                        ):
+                            return
+                        self._write_final_transcript(
+                            metadata["transcript_path"], operation_id, final_result
+                        )
+                        self.manager.update(
+                            operation_id,
+                            partial_result=final_result,
+                            progress_pct=100,
+                            message="Транскрипция завершена!",
+                            eta_seconds=0,
+                            pending_action=None,
+                        )
+                        self.manager.transition(operation_id, "completed")
+
+                    if self.project_store is not None:
+                        try:
+                            self.project_store.remove_checkpoint(latest["video_id"])
+                        except OSError:
+                            logger.exception(
+                                "Final transcript saved but checkpoint cleanup failed"
+                            )
             self._publish_snapshot(operation_id, loop)
         except Exception as exc:
             logger.exception("Transcription worker failed")
@@ -688,6 +714,10 @@ class TranscriptionService:
     def _operation_action_lock(self, operation_id: str) -> threading.Lock:
         with self._lock:
             return self._action_locks.setdefault(operation_id, threading.Lock())
+
+    def _video_action_lock(self, video_id: str) -> threading.Lock:
+        with self._lock:
+            return self._video_action_locks.setdefault(video_id, threading.Lock())
 
     def _is_current_generation(self, operation_id: str, generation: int) -> bool:
         with self._lock:

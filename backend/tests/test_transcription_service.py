@@ -102,6 +102,21 @@ class BlockingPredecessorCheckpointStore(FakeProjectStore):
         return copy.deepcopy(saved)
 
 
+class BlockingCompletionCleanupStore(FakeProjectStore):
+    """Keeps final checkpoint cleanup open while a restart races it."""
+
+    def __init__(self):
+        super().__init__()
+        self.cleanup_blocked = threading.Event()
+        self.release_cleanup = threading.Event()
+
+    def remove_checkpoint(self, project_id):
+        self.cleanup_blocked.set()
+        if not self.release_cleanup.wait(1.0):
+            raise TimeoutError("completion cleanup was not released")
+        return super().remove_checkpoint(project_id)
+
+
 class ControllableTranscriber:
     def __init__(self, fail_after_partial=False):
         self.release = threading.Event()
@@ -650,6 +665,47 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reused["operation_id"], first["operation_id"])
         self.assertEqual(reused["status"], "completed")
         self.assertEqual(len(transcriber.calls), 1)
+
+    async def test_restart_cannot_replace_checkpoint_during_final_cleanup(self):
+        store = BlockingCompletionCleanupStore()
+        transcriber = ControllableTranscriber()
+        service = TranscriptionService(
+            OperationManager(), transcriber, self.publish, store
+        )
+        loop = asyncio.get_running_loop()
+        operation = service.start(
+            "video-1", "video.mp4", None, self.transcript_path, loop
+        )
+        await self.assert_event_set(transcriber.first_started)
+        transcriber.release.set()
+        await self.assert_event_set(store.cleanup_blocked)
+
+        restart = asyncio.create_task(
+            asyncio.to_thread(
+                service.restart_from_zero,
+                "video-1",
+                "video.mp4",
+                None,
+                self.transcript_path,
+                loop,
+            )
+        )
+        await asyncio.sleep(0.03)
+        self.assertFalse(
+            restart.done(),
+            "restart must wait until final transcript and cleanup are committed",
+        )
+
+        store.release_cleanup.set()
+        with self.assertRaisesRegex(
+            OperationConflictError, "Completed transcript already exists"
+        ):
+            await restart
+
+        completed = await service.wait_for_terminal(operation["operation_id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertNotIn("video-1", store.checkpoints)
+        self.assertEqual(store.transcripts["video-1"]["full_text"], "готовый текст")
 
     async def test_final_project_write_failure_fails_and_keeps_checkpoint(self):
         transcriber = ControllableTranscriber()
