@@ -143,10 +143,10 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
       const r = await fetch(`${apiBase}/api/banner/current`);
       const data = await r.json();
       setBannerInfo(data);
-      onBannerStatusChange?.(data.has_banner);
+      onBannerStatusChange?.(data.has_banner, 'loaded');
     } catch {
       setBannerInfo({ has_banner: false });
-      onBannerStatusChange?.(false);
+      onBannerStatusChange?.(false, 'loaded');
     }
   };
 
@@ -163,7 +163,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
       }
       const data = await r.json();
       setBannerInfo({ has_banner: true, ...data });
-      onBannerStatusChange?.(true);
+      onBannerStatusChange?.(true, 'uploaded');
     } catch (err) {
       alert(`Ошибка загрузки баннера: ${err.message}`);
     } finally {
@@ -176,7 +176,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
     try {
       await fetch(`${apiBase}/api/banner/remove`, { method: 'DELETE' });
       setBannerInfo({ has_banner: false });
-      onBannerStatusChange?.(false);
+      onBannerStatusChange?.(false, 'removed');
     } catch {
       alert('Не удалось удалить баннер');
     }

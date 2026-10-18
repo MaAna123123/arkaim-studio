@@ -1143,8 +1143,10 @@ export default function App({ recentProjectsOverride = null } = {}) {
                 onAdStatusChange={(hasAdStatus) => {
                   setHasAd(hasAdStatus);
                 }}
-                onBannerStatusChange={(hasBannerStatus) => {
+                onBannerStatusChange={(hasBannerStatus, source) => {
                   setHasVideoBanner(hasBannerStatus);
+                  if (source === 'uploaded') setVideoBannerEnabled(true);
+                  if (!hasBannerStatus) setVideoBannerEnabled(false);
                 }}
               />
             </div>
