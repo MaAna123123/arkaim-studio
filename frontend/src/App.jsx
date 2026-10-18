@@ -81,7 +81,7 @@ async function readApiResponse(response) {
   return data;
 }
 
-export default function App() {
+export default function App({ recentProjectsOverride = null } = {}) {
   const [restoredSession] = useState(loadStoredSession);
 
   // ── State ──────────────────────────────────────────────────────────────────
@@ -315,7 +315,9 @@ export default function App() {
     });
   }
   const projectLifecycle = projectLifecycleRef.current;
-  const showRecentProjects = canUseRecentProjects({
+  const hasRecentProjectsOverride = Array.isArray(recentProjectsOverride);
+  const recentProjectsForView = hasRecentProjectsOverride ? recentProjectsOverride : recentProjects;
+  const showRecentProjects = hasRecentProjectsOverride || canUseRecentProjects({
     serverOnline,
     hasVideo: Boolean(video),
   });
@@ -883,7 +885,7 @@ export default function App() {
         )}
 
         {/* ── Tabs for Input ────────────────────────────────────────────── */}
-        {!video && (
+        {(!video || hasRecentProjectsOverride) && (
           <section style={{ marginBottom: 28 }}>
 
             {projectDiagnostics.map((diagnostic) => (
@@ -899,7 +901,7 @@ export default function App() {
 
             {showRecentProjects && (
               <RecentProjects
-                projects={recentProjects}
+                projects={recentProjectsForView}
                 pendingAction={projectPendingAction}
                 onOpen={(project) => hydrateRecentProject(project)}
                 onResume={(project) => hydrateRecentProject(project, { resume: true })}

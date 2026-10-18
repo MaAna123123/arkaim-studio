@@ -230,7 +230,7 @@ function createTransport() {
   };
 }
 
-async function mountApp(t, session) {
+async function mountApp(t, session, appProps = {}) {
   const browser = installBrowser(t, session);
   const transport = createTransport();
   const originalFetch = globalThis.fetch;
@@ -238,7 +238,7 @@ async function mountApp(t, session) {
 
   let renderer;
   await act(async () => {
-    renderer = TestRenderer.create(createElement(App));
+    renderer = TestRenderer.create(createElement(App, appProps));
     await flush();
   });
   t.after(async () => {
@@ -281,6 +281,20 @@ function buttonByText(renderer, text, index = 0) {
   );
   assert.ok(buttons[index], `expected visible button: ${text}`);
   return buttons[index];
+}
+
+function recentProjectCardByTitle(renderer, title) {
+  const card = renderer.root.findAllByType('article').find((candidate) => (
+    candidate.findAllByType('h3').some((heading) => heading.props.title === title)
+  ));
+  assert.ok(card, `expected visible recent-project card: ${title}`);
+  return card;
+}
+
+function buttonInCard(card, text) {
+  const button = card.findAllByType('button').find((candidate) => candidate.children.join('') === text);
+  assert.ok(button, `expected visible card button: ${text}`);
+  return button;
 }
 
 async function answerRecentProjects(transport, projects) {
@@ -527,6 +541,42 @@ test('mounted App only autosaves an editor change after 700ms and cancels pendin
   assert.equal(transport.requestsFor('/api/projects/project-b', 'PATCH').length, 0, 'unmount must cancel an unsent autosave');
 });
 
+test('mounted recent-project navigation aborts A autosave and a late A failure cannot affect B', async (t) => {
+  const projects = [
+    recentProject('project-a', 'Autosave A'),
+    recentProject('project-b', 'Autosave B'),
+  ];
+  const { browser, renderer, transport } = await mountApp(t, null, {
+    recentProjectsOverride: projects,
+  });
+
+  await answerLatestHealth(transport, true);
+  await act(async () => {
+    buttonByText(renderer, 'Открыть', 0).props.onClick();
+    await flush();
+  });
+  await answerDetail(transport.detailRequests('project-a').at(-1), project('project-a', 'Autosave A'));
+  await act(async () => {
+    renderer.root.findByProps({ id: 'export-padding-input' }).props.onChange({ target: { value: '0.9' } });
+    await flush();
+  });
+  await browser.advanceTimers(700);
+
+  const patchA = transport.requestsFor('/api/projects/project-a', 'PATCH')[0];
+  assert.ok(patchA, 'A edit must have an in-flight autosave before navigation');
+  await act(async () => {
+    buttonByText(renderer, 'Открыть', 1).props.onClick();
+    await flush();
+  });
+  assert.equal(patchA.options.signal.aborted, true, 'opening B directly must abort A autosave');
+
+  await answerDetail(transport.detailRequests('project-b').at(-1), project('project-b', 'Autosave B'));
+  await answerDetail(patchA, { detail: 'late A autosave failure' }, { ok: false, status: 503 });
+
+  assert.equal(renderer.root.findByProps({ className: 'video-info-name' }).children.join(''), 'Autosave B.mp4');
+  assert.equal(renderer.root.findAllByProps({ role: 'alert' }).length, 0, 'late A must not surface an error over B');
+});
+
 test('mounted App scopes restart pending state to the project and ignores late restart snapshots', async (t) => {
   const { renderer, transport } = await mountApp(t);
   const projects = [
@@ -591,6 +641,73 @@ test('mounted App scopes restart pending state to the project and ignores late r
   );
 });
 
+for (const invalidRestart of [
+  {
+    name: 'wrong video id',
+    snapshot: {
+      operation_id: 'operation-wrong-video',
+      operation_type: 'transcription',
+      video_id: 'project-a',
+      status: 'queued',
+    },
+  },
+  {
+    name: 'missing operation id',
+    snapshot: {
+      operation_type: 'transcription',
+      video_id: 'project-b',
+      status: 'queued',
+    },
+  },
+]) {
+  test(`mounted App rejects B restart snapshot with ${invalidRestart.name} without updating its card`, async (t) => {
+    const { renderer, transport } = await mountApp(t);
+    const projects = [
+      recentProject('project-a', 'Restart A', { status: 'failed' }),
+      recentProject('project-b', 'Restart B', { status: 'failed' }),
+    ];
+
+    await answerLatestHealth(transport, true);
+    await answerRecentProjects(transport, projects);
+    await act(async () => {
+      buttonInCard(recentProjectCardByTitle(renderer, 'Restart B'), 'Начать заново').props.onClick();
+      await flush();
+    });
+
+    const restartB = transport.requestsFor('/api/projects/project-b/transcription/restart', 'POST')[0];
+    assert.ok(restartB, 'B restart must use the selected project endpoint');
+    assert.equal(
+      buttonInCard(recentProjectCardByTitle(renderer, 'Restart B'), 'Начать заново').props.disabled,
+      true,
+      'B is pending until its own response is validated',
+    );
+    assert.equal(
+      buttonInCard(recentProjectCardByTitle(renderer, 'Restart A'), 'Начать заново').props.disabled,
+      false,
+      'B pending state must not disable A',
+    );
+
+    await answerDetail(restartB, invalidRestart.snapshot);
+
+    const cardB = recentProjectCardByTitle(renderer, 'Restart B');
+    assert.equal(cardB.props.className, 'recent-project-card recent-project-card-failed');
+    assert.equal(
+      buttonInCard(cardB, 'Начать заново').props.disabled,
+      false,
+      'the invalid B request must clear only its own pending token',
+    );
+    assert.equal(
+      buttonInCard(recentProjectCardByTitle(renderer, 'Restart A'), 'Начать заново').props.disabled,
+      false,
+      'rejecting B must leave A unchanged',
+    );
+    assert.match(
+      renderer.root.findByProps({ role: 'alert' }).children.join(''),
+      /Ответ операции не соответствует выбранному проекту/,
+    );
+  });
+}
+
 test('mounted App discards a retryable startup restore candidate when a local upload replaces it', async (t) => {
   const { browser, renderer, transport } = await mountApp(t, restoredSession('project-a'));
 
@@ -633,7 +750,9 @@ test('mounted App discards a retryable startup restore candidate when a local up
 });
 
 test('mounted App does not retry failed startup A after the user explicitly opens B', async (t) => {
-  const { browser, renderer, transport } = await mountApp(t, restoredSession('project-a'));
+  const { browser, renderer, transport } = await mountApp(t, restoredSession('project-a'), {
+    recentProjectsOverride: [recentProject('project-b', 'Explicit B')],
+  });
 
   await answerLatestHealth(transport, true);
   await answerDetail(
@@ -641,11 +760,6 @@ test('mounted App does not retry failed startup A after the user explicitly open
     { detail: 'temporary outage' },
     { ok: false, status: 503 },
   );
-  await act(async () => {
-    renderer.root.findByProps({ id: 'btn-reset-video' }).props.onClick();
-    await flush();
-  });
-  await answerRecentProjects(transport, [recentProject('project-b', 'Explicit B')]);
   await act(async () => {
     buttonByText(renderer, 'Открыть').props.onClick();
     await flush();
