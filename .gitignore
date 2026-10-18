@@ -1,0 +1,65 @@
+# Node & Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+runtime/
+cache/
+.corepack/
+.npm-cache/
+.pip-cache/
+.tmp/
+.superpowers/
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Project Temp & Cache Directories
+temp/
+backend/temp/
+models_cache/
+data/
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/clips/*
+!backend/clips/.gitkeep
+backend/thumbs/*
+!backend/thumbs/.gitkeep
+backend/transcripts/*
+!backend/transcripts/.gitkeep
+backend/ads/*
+!backend/ads/.gitkeep
+backend/banners/*
+!backend/banners/.gitkeep
+
+# Sensitive & Secret Files
+backend/settings.json
+backend/client_secret.json
+backend/token.json
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# IDE & System Files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Scratch scripts
+backend/scratch_*.py
