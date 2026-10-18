@@ -147,6 +147,7 @@ export default function App() {
   const autosaveControllerRef = useRef(null);
   const autosaveRequestRef = useRef(null);
   const autosaveSchedulerRef = useRef(null);
+  const suppressNextAutosaveRef = useRef(false);
   const projectLifecycleRef = useRef(null);
   const restoreCandidateRef = useRef(
     restoredSession.video?.video_id
@@ -238,6 +239,7 @@ export default function App() {
     const mapped = mapProjectToEditorState(project);
     const hydratedVideo = buildHydratedProjectVideo(project, mapped.video);
     cancelProjectAutosave();
+    suppressNextAutosaveRef.current = true;
     pendingResumeOperationIdRef.current = resumeOperationId;
 
     setVideo(hydratedVideo);
@@ -410,6 +412,11 @@ export default function App() {
 
   useEffect(() => {
     if (!serverOnline) {
+      autosaveSchedulerRef.current?.cancel();
+      return undefined;
+    }
+    if (suppressNextAutosaveRef.current) {
+      suppressNextAutosaveRef.current = false;
       autosaveSchedulerRef.current?.cancel();
       return undefined;
     }
