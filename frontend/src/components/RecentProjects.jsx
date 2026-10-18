@@ -2,8 +2,10 @@ import { getProjectCardState } from '../lib/projectState';
 
 
 function pendingForProject(pendingAction, projectId) {
-  if (pendingAction && typeof pendingAction === 'object') return pendingAction[projectId];
-  return pendingAction;
+  if (!pendingAction || typeof pendingAction !== 'object' || Array.isArray(pendingAction)) return null;
+  const pendingProjectId = pendingAction.projectId ?? pendingAction.project_id;
+  if (pendingProjectId !== projectId) return null;
+  return pendingAction.action ?? pendingAction.pendingAction ?? true;
 }
 
 function run(handler, project) {
@@ -61,11 +63,12 @@ export default function RecentProjects({
               )}
 
               <div className="recent-project-actions">
-                <button className="btn btn-secondary btn-sm" onClick={() => run(onOpen, project)}>
+                <button type="button" className="btn btn-secondary btn-sm" onClick={() => run(onOpen, project)}>
                   {detailsOnly ? 'Детали проекта' : 'Открыть'}
                 </button>
                 {state.actions.resume && (
                   <button
+                    type="button"
                     className="btn btn-success btn-sm"
                     disabled={state.actionDisabled.resume}
                     aria-label={state.resumeLabel}
@@ -76,6 +79,7 @@ export default function RecentProjects({
                 )}
                 {state.actions.restart && (
                   <button
+                    type="button"
                     className="btn btn-ghost btn-sm"
                     disabled={state.actionDisabled.restart}
                     onClick={() => confirmRestart(project)}

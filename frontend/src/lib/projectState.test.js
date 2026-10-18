@@ -80,6 +80,33 @@ test('older incomplete project records receive safe editor defaults and never au
   assert.equal(state.shouldStartTranscription, false);
 });
 
+test('project hydration returns independent mutable editor data', () => {
+  const project = {
+    video_id: 'video-1',
+    video: { metadata: { duration: 90 } },
+    transcription: { status: 'stopped', partial_result: { checkpoint: 12 } },
+    editor: {
+      segments: [{ start: 4, words: [{ text: 'Привет' }] }],
+      selected: [0],
+      clip_results: [{ filename: 'clip.mp4', metadata: { size: 12 } }],
+      subtitle_context: { source: { language: 'ru' } },
+    },
+  };
+
+  const state = mapProjectToEditorState(project);
+  state.video.metadata.duration = 120;
+  state.segments[0].words[0].text = 'Изменено';
+  state.clipResults[0].metadata.size = 99;
+  state.subtitleContext.source.language = 'en';
+  state.transcription.partial_result.checkpoint = 33;
+
+  assert.equal(project.video.metadata.duration, 90);
+  assert.equal(project.editor.segments[0].words[0].text, 'Привет');
+  assert.equal(project.editor.clip_results[0].metadata.size, 12);
+  assert.equal(project.editor.subtitle_context.source.language, 'ru');
+  assert.equal(project.transcription.partial_result.checkpoint, 12);
+});
+
 test('missing source wins card precedence while details remain available', () => {
   const state = getProjectCardState({
     source_exists: false,
@@ -140,4 +167,22 @@ test('pending actions disable only duplicate recovery commands and preserve the 
   assert.equal(state.actionDisabled.resume, true);
   assert.equal(state.actionDisabled.restart, true);
   assert.equal(formatProjectProgress({ transcription: { progress_pct: 37.6 } }), 38);
+});
+
+test('progress accepts only valid numeric values and keeps unknown checkpoints out of resume labels', () => {
+  const unknownValues = [undefined, null, '', '   ', false, true, -1, 101];
+  for (const progressPct of unknownValues) {
+    const project = progressPct === undefined
+      ? { transcription: { status: 'stopped', resume_available: true } }
+      : { transcription: { status: 'stopped', progress_pct: progressPct, resume_available: true } };
+    assert.equal(formatProjectProgress(project), null);
+    assert.equal(getProjectCardState(project).resumeLabel, 'Продолжить');
+  }
+
+  assert.equal(formatProjectProgress({ transcription: { progress_pct: '37.6' } }), 38);
+  assert.equal(formatProjectProgress({ transcription: { progress_pct: 37.4 } }), 37);
+  assert.equal(
+    getProjectCardState({ transcription: { status: 'stopped', progress_pct: 37.6, resume_available: true } }).resumeLabel,
+    'Продолжить с 38%',
+  );
 });

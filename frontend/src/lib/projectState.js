@@ -25,6 +25,16 @@ function listOrEmpty(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function cloneProjectValue(value) {
+  if (Array.isArray(value)) return value.map(cloneProjectValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, cloneProjectValue(item)]),
+    );
+  }
+  return value;
+}
+
 function numberOrDefault(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
@@ -36,7 +46,7 @@ function booleanOrDefault(value, fallback) {
 export function mapProjectToEditorState(project) {
   const source = objectOrEmpty(project);
   const editor = objectOrEmpty(source.editor);
-  const savedVideo = objectOrEmpty(source.video);
+  const savedVideo = cloneProjectValue(objectOrEmpty(source.video));
   const videoId = source.video_id ?? source.project_id ?? savedVideo.video_id;
   const title = source.title ?? savedVideo.title;
   const video = videoId || title || Object.keys(savedVideo).length
@@ -47,13 +57,15 @@ export function mapProjectToEditorState(project) {
     projectId: source.project_id ?? null,
     video,
     transcript: source.has_transcript === true ? { has_transcript: true } : null,
-    subtitleContext: editor.subtitle_context ?? DEFAULT_EDITOR_STATE.subtitle_context,
+    subtitleContext: editor.subtitle_context == null
+      ? DEFAULT_EDITOR_STATE.subtitle_context
+      : cloneProjectValue(editor.subtitle_context),
     subtitleNotice: typeof editor.subtitle_notice === 'string'
       ? editor.subtitle_notice
       : DEFAULT_EDITOR_STATE.subtitle_notice,
-    segments: listOrEmpty(editor.segments),
-    selected: new Set(listOrEmpty(editor.selected)),
-    clipResults: listOrEmpty(editor.clip_results),
+    segments: cloneProjectValue(listOrEmpty(editor.segments)),
+    selected: new Set(cloneProjectValue(listOrEmpty(editor.selected))),
+    clipResults: cloneProjectValue(listOrEmpty(editor.clip_results)),
     exportPadding: numberOrDefault(editor.export_padding, DEFAULT_EDITOR_STATE.export_padding),
     aspectRatio: typeof editor.aspect_ratio === 'string' && editor.aspect_ratio
       ? editor.aspect_ratio
@@ -77,16 +89,19 @@ export function mapProjectToEditorState(project) {
       editor.video_banner_height,
       DEFAULT_EDITOR_STATE.video_banner_height,
     ),
-    transcription: objectOrEmpty(source.transcription),
+    transcription: cloneProjectValue(objectOrEmpty(source.transcription)),
     shouldStartTranscription: false,
   };
 }
 
 export function formatProjectProgress(project) {
   const transcription = objectOrEmpty(objectOrEmpty(project).transcription);
-  const progress = Number(transcription.progress_pct);
-  if (!Number.isFinite(progress)) return null;
-  return Math.round(Math.min(100, Math.max(0, progress)));
+  const rawProgress = transcription.progress_pct;
+  if (typeof rawProgress !== 'number' && typeof rawProgress !== 'string') return null;
+  if (typeof rawProgress === 'string' && rawProgress.trim() === '') return null;
+  const progress = Number(rawProgress);
+  if (!Number.isFinite(progress) || progress < 0 || progress > 100) return null;
+  return Math.round(progress);
 }
 
 function cardState(kind, label, actions, project, options = {}) {
