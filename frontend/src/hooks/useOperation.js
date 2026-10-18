@@ -64,6 +64,77 @@ async function readResponse(response) {
   return data;
 }
 
+export function createOperationActionRunner({
+  fetchImpl = (...args) => fetch(...args),
+  readResponse: parseResponse = readResponse,
+  onPendingAction = () => {},
+} = {}) {
+  let generation = 0;
+  let controller = null;
+  let pendingAction = '';
+
+  const reset = () => {
+    generation += 1;
+    controller?.abort();
+    controller = null;
+    if (pendingAction) {
+      pendingAction = '';
+      onPendingAction('');
+    }
+  };
+
+  return {
+    reset,
+    run({
+      apiBase,
+      action,
+      operationId,
+      videoId,
+      currentOperation,
+      acceptSnapshot,
+    }) {
+      if (
+        pendingAction
+        || !operationId
+        || currentOperation?.operation_id !== operationId
+        || currentOperation?.video_id !== videoId
+      ) return Promise.resolve(null);
+
+      const requestGeneration = generation;
+      const requestController = new AbortController();
+      controller = requestController;
+      pendingAction = action;
+      onPendingAction(action);
+
+      return (async () => {
+        try {
+          const response = await fetchImpl(
+            `${apiBase}/api/operations/${operationId}/${action}`,
+            { method: 'POST', signal: requestController.signal },
+          );
+          const snapshot = await parseResponse(response);
+          if (
+            requestGeneration !== generation
+            || controller !== requestController
+            || snapshot?.operation_id !== operationId
+            || snapshot?.video_id !== videoId
+          ) return null;
+          return acceptSnapshot?.(snapshot) ? snapshot : null;
+        } catch (error) {
+          if (error?.name === 'AbortError') return null;
+          throw error;
+        } finally {
+          if (requestGeneration === generation && controller === requestController) {
+            controller = null;
+            pendingAction = '';
+            onPendingAction('');
+          }
+        }
+      })();
+    },
+  };
+}
+
 export default function useOperation({ apiBase, videoId, onCompleted }) {
   const [operation, setOperation] = useState(null);
   const [error, setError] = useState('');
@@ -74,6 +145,16 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
   const pendingActionRef = useRef('');
   const generationRef = useRef(0);
   const requestControllersRef = useRef(new Set());
+  const actionRunnerRef = useRef(null);
+
+  if (actionRunnerRef.current === null) {
+    actionRunnerRef.current = createOperationActionRunner({
+      onPendingAction: (action) => {
+        pendingActionRef.current = action;
+        setPendingAction(action);
+      },
+    });
+  }
 
   const applySnapshot = useCallback((snapshot, options = {}) => {
     const {
@@ -127,6 +208,7 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     const generation = generationRef.current;
     requestControllersRef.current.forEach((controller) => controller.abort());
     requestControllersRef.current.clear();
+    actionRunnerRef.current.reset();
     operationRef.current = null;
     completedRef.current = null;
     pendingActionRef.current = '';
@@ -158,6 +240,7 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     restore();
     return () => {
       controller.abort();
+      actionRunnerRef.current.reset();
       if (generationRef.current === generation) generationRef.current += 1;
     };
   }, [apiBase, videoId, applySnapshot]);
@@ -263,29 +346,20 @@ export default function useOperation({ apiBase, videoId, onCompleted }) {
     ) return null;
     const generation = generationRef.current;
     const expectedVideo = videoId;
-    const controller = new AbortController();
-    requestControllersRef.current.add(controller);
     setError('');
-    pendingActionRef.current = action;
-    setPendingAction(action);
     try {
-      const response = await fetch(`${apiBase}/api/operations/${operationId}/${action}`, {
-        method: 'POST',
-        signal: controller.signal,
+      return await actionRunnerRef.current.run({
+        apiBase,
+        action,
+        operationId,
+        videoId: expectedVideo,
+        currentOperation: current,
+        acceptSnapshot: (snapshot) => applySnapshot(snapshot, { generation, expectedVideo }),
       });
-      const snapshot = await readResponse(response);
-      applySnapshot(snapshot, { generation, expectedVideo });
-      return snapshot;
     } catch (controlError) {
       if (controlError.name === 'AbortError') return null;
       if (generation === generationRef.current) setError(controlError.message);
       throw controlError;
-    } finally {
-      requestControllersRef.current.delete(controller);
-      if (generation === generationRef.current && pendingActionRef.current === action) {
-        pendingActionRef.current = '';
-        setPendingAction('');
-      }
     }
   }, [apiBase, applySnapshot, videoId]);
 

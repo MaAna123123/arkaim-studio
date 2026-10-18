@@ -4,11 +4,19 @@ import test from 'node:test';
 import {
   canApplyOperationSnapshot,
   claimRecoveredOperation,
+  createOperationActionRunner,
   formatEta,
   getOperationActions,
   isUnfinishedTranscription,
   matchesOperationEvent,
 } from './useOperation.js';
+
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 
 test('running, paused, and stopped states expose only valid controls', () => {
@@ -115,6 +123,71 @@ test('a pending operation action suppresses a duplicate recovered resume claim',
     claimRecoveredOperation(recovered, 'recovered-op', 'video-1', 'resume'),
     null,
   );
+});
+
+test('Continue posts the recovered operation id once and rejects a stale-video success', async () => {
+  const requests = [];
+  const pending = [];
+  const runner = createOperationActionRunner({
+    fetchImpl: (url, options) => {
+      const result = deferred();
+      requests.push({ url, options, ...result });
+      return result.promise;
+    },
+    readResponse: async (response) => response,
+    onPendingAction: (action) => pending.push(action),
+  });
+  const currentOperation = {
+    operation_id: 'recovered-op', video_id: 'video-1', status: 'stopped',
+  };
+  const accepted = [];
+
+  const first = runner.run({
+    apiBase: 'http://api.test', action: 'resume', operationId: 'recovered-op',
+    videoId: 'video-1', currentOperation,
+    acceptSnapshot: (snapshot) => { accepted.push(snapshot); return true; },
+  });
+  const duplicate = runner.run({
+    apiBase: 'http://api.test', action: 'resume', operationId: 'recovered-op',
+    videoId: 'video-1', currentOperation, acceptSnapshot: () => true,
+  });
+
+  assert.equal(await duplicate, null);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, 'http://api.test/api/operations/recovered-op/resume');
+  requests[0].resolve({
+    operation_id: 'recovered-op', video_id: 'stale-video', status: 'running',
+  });
+  assert.equal(await first, null);
+  assert.deepEqual(accepted, []);
+  assert.deepEqual(pending, ['resume', '']);
+});
+
+test('operation action runner aborts and ignores a response after reset', async () => {
+  const requests = [];
+  const accepted = [];
+  const runner = createOperationActionRunner({
+    fetchImpl: (url, options) => {
+      const result = deferred();
+      requests.push({ url, options, ...result });
+      return result.promise;
+    },
+    readResponse: async (response) => response,
+  });
+  const running = runner.run({
+    apiBase: 'http://api.test', action: 'resume', operationId: 'operation-1',
+    videoId: 'video-1',
+    currentOperation: { operation_id: 'operation-1', video_id: 'video-1' },
+    acceptSnapshot: (snapshot) => { accepted.push(snapshot); return true; },
+  });
+
+  runner.reset();
+  assert.equal(requests[0].options.signal.aborted, true);
+  requests[0].resolve({
+    operation_id: 'operation-1', video_id: 'video-1', status: 'running',
+  });
+  assert.equal(await running, null);
+  assert.deepEqual(accepted, []);
 });
 
 test('eta is formatted without exposing invalid values', () => {

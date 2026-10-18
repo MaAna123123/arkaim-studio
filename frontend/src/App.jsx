@@ -18,6 +18,10 @@ import RecentProjects from './components/RecentProjects';
 import useOperation, { isUnfinishedTranscription } from './hooks/useOperation';
 import { mapProjectToEditorState } from './lib/projectState';
 import {
+  canUseRecentProjects,
+  createProjectLifecycleController,
+} from './lib/projectLifecycle';
+import {
   buildHydratedProjectVideo,
   clearSession,
   createProjectAutosaveScheduler,
@@ -87,7 +91,9 @@ export default function App() {
   const [projectDiagnostics, setProjectDiagnostics] = useState([]);
   const [projectError, setProjectError] = useState('');
   const [projectPendingAction, setProjectPendingAction] = useState(null);
-  const [currentProjectId, setCurrentProjectId] = useState(null);
+  const [currentProjectId, setCurrentProjectId] = useState(
+    () => restoredSession.projectId || restoredSession.video?.video_id || null,
+  );
   const [hydratedOperation, setHydratedOperation] = useState(null);
   const [recentProjectsRevision, setRecentProjectsRevision] = useState(0);
 
@@ -136,15 +142,12 @@ export default function App() {
   const subtitleInputRef = useRef(null);
   const afterChapterImportRef = useRef(false);
   const selectedVideoIdRef = useRef(video?.video_id);
-  const hydratedProjectIdRef = useRef(null);
   const pendingResumeOperationIdRef = useRef(null);
-  const projectLoadGenerationRef = useRef(0);
-  const projectLoadControllerRef = useRef(null);
   const autosaveGenerationRef = useRef(0);
   const autosaveControllerRef = useRef(null);
   const autosaveRequestRef = useRef(null);
   const autosaveSchedulerRef = useRef(null);
-  const restoredProjectAttemptRef = useRef(false);
+  const projectLifecycleRef = useRef(null);
   selectedVideoIdRef.current = video?.video_id;
 
   if (autosaveSchedulerRef.current === null) {
@@ -200,12 +203,6 @@ export default function App() {
     autosaveControllerRef.current = null;
   }, []);
 
-  const cancelProjectLoad = useCallback(() => {
-    projectLoadGenerationRef.current += 1;
-    projectLoadControllerRef.current?.abort();
-    projectLoadControllerRef.current = null;
-  }, []);
-
   autosaveRequestRef.current = async (projectId, payload) => {
     const generation = autosaveGenerationRef.current;
     const controller = new AbortController();
@@ -232,7 +229,6 @@ export default function App() {
     const mapped = mapProjectToEditorState(project);
     const hydratedVideo = buildHydratedProjectVideo(project, mapped.video);
     cancelProjectAutosave();
-    hydratedProjectIdRef.current = null;
     pendingResumeOperationIdRef.current = resumeOperationId;
 
     setVideo(hydratedVideo);
@@ -260,7 +256,6 @@ export default function App() {
     setProgress({ pct: 0, msg: '', step: '' });
     setHydratedOperation(recoveredOperationForProject(project));
     setCurrentProjectId(mapped.projectId);
-    hydratedProjectIdRef.current = mapped.projectId;
 
     const checkpointDiagnostic = project?.transcription?.diagnostic;
     setProjectError(checkpointDiagnostic
@@ -268,76 +263,63 @@ export default function App() {
       : '');
   }, [cancelProjectAutosave]);
 
-  const loadProjectDetails = useCallback(async (projectId) => {
-    cancelProjectLoad();
-    cancelProjectAutosave();
-    hydratedProjectIdRef.current = null;
-    const generation = projectLoadGenerationRef.current;
-    const controller = new AbortController();
-    projectLoadControllerRef.current = controller;
-    try {
-      const response = await fetch(`${API}/api/projects/${projectId}`, {
-        signal: controller.signal,
-      });
-      const project = await readApiResponse(response);
-      if (generation !== projectLoadGenerationRef.current) return null;
-      return project;
-    } finally {
-      if (projectLoadControllerRef.current === controller) projectLoadControllerRef.current = null;
-    }
-  }, [cancelProjectAutosave, cancelProjectLoad]);
-
-  useEffect(() => {
-    if (!serverOnline) return undefined;
-    const controller = new AbortController();
-    const fetchRecentProjects = async () => {
-      try {
-        const response = await fetch(`${API}/api/projects?limit=20`, {
-          signal: controller.signal,
-        });
-        const data = await readApiResponse(response);
+  if (projectLifecycleRef.current === null) {
+    projectLifecycleRef.current = createProjectLifecycleController({
+      apiBase: API,
+      readResponse: readApiResponse,
+      autosave: autosaveSchedulerRef.current,
+      cancelAutosaveRequest: cancelProjectAutosave,
+      hydrateProject: applyProjectDetails,
+      clearMissingProject: (project) => {
+        pendingResumeOperationIdRef.current = null;
+        setCurrentProjectId(null);
+        setHydratedOperation(null);
+        setVideo(null);
+        setVideoUrl(null);
+        setTranscript(null);
+        setSubtitleContext(null);
+        setSubtitleNotice('');
+        setSegments([]);
+        setSelected(new Set());
+        setClipResults([]);
+        clearSession(window.sessionStorage);
+        setProjectError(diagnosticMessage(
+          project.source_diagnostic,
+          'Исходный файл проекта не найден; данные проекта сохранены на сервере',
+        ));
+      },
+      receiveRecentProjects: (data) => {
         setRecentProjects(Array.isArray(data?.projects) ? data.projects : []);
         setProjectDiagnostics(Array.isArray(data?.diagnostics) ? data.diagnostics : []);
-      } catch (listError) {
-        if (listError.name !== 'AbortError') {
-          setProjectError(`Не удалось загрузить проекты: ${listError.message}`);
-        }
-      }
-    };
-    fetchRecentProjects();
-    return () => controller.abort();
-  }, [serverOnline, recentProjectsRevision]);
+      },
+      receiveRestart: (projectId, snapshot) => {
+        setRecentProjects((projects) => projects.map((item) => (
+          item.project_id === projectId
+            ? { ...item, transcription: snapshot, has_transcript: false }
+            : item
+        )));
+      },
+      setPendingAction: setProjectPendingAction,
+      setError: setProjectError,
+    });
+  }
+  const projectLifecycle = projectLifecycleRef.current;
+  const showRecentProjects = canUseRecentProjects({
+    serverOnline,
+    hasVideo: Boolean(video),
+  });
+
+  useEffect(() => {
+    projectLifecycle.syncRecentProjects({ serverOnline, hasVideo: Boolean(video) });
+    return () => projectLifecycle.cancelRecent();
+  }, [projectLifecycle, serverOnline, Boolean(video), recentProjectsRevision]);
 
   useEffect(() => {
     const restoredProjectId = restoredSession.video?.video_id;
-    if (!serverOnline || !restoredProjectId || restoredProjectAttemptRef.current) return undefined;
-    restoredProjectAttemptRef.current = true;
-    let disposed = false;
-    loadProjectDetails(restoredProjectId)
-      .then((project) => {
-        if (disposed || !project) return;
-        if (project.source_exists === false) {
-          setVideo(null);
-          setVideoUrl(null);
-          setProjectError(diagnosticMessage(
-            project.source_diagnostic,
-            'Исходный файл проекта не найден',
-          ));
-          return;
-        }
-        applyProjectDetails(project);
-      })
-      .catch((loadError) => {
-        if (!disposed && loadError.name !== 'AbortError') {
-          setVideo(null);
-          setVideoUrl(null);
-          setProjectError(`Не удалось восстановить проект: ${loadError.message}`);
-        }
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [applyProjectDetails, loadProjectDetails, restoredSession.video?.video_id, serverOnline]);
+    if (!serverOnline || !restoredProjectId) return undefined;
+    projectLifecycle.loadProject(restoredProjectId, { origin: 'restore' });
+    return () => projectLifecycle.cancelDetail();
+  }, [projectLifecycle, restoredSession.video?.video_id, serverOnline]);
 
   useEffect(() => {
     if (!hydratedOperation || hydratedOperation.video_id !== video?.video_id) return undefined;
@@ -348,7 +330,7 @@ export default function App() {
 
     if (!adopted || resumeId !== hydratedOperation.operation_id) {
       setProjectError('Сохранённую операцию не удалось привязать к этому проекту');
-      setProjectPendingAction(null);
+      projectLifecycle.completePending(video.video_id, 'resume');
       return undefined;
     }
 
@@ -363,12 +345,12 @@ export default function App() {
         if (!disposed && resumeError.name !== 'AbortError') setProjectError(resumeError.message);
       })
       .finally(() => {
-        if (!disposed) setProjectPendingAction(null);
+        if (!disposed) projectLifecycle.completePending(video.video_id, 'resume');
       });
     return () => {
       disposed = true;
     };
-  }, [adoptTranscriptionOperation, hydratedOperation, resumeOperation, video?.video_id]);
+  }, [adoptTranscriptionOperation, hydratedOperation, projectLifecycle, resumeOperation, video?.video_id]);
 
   useEffect(() => {
     if (!video) {
@@ -403,9 +385,9 @@ export default function App() {
       autosaveSchedulerRef.current?.cancel();
       return undefined;
     }
-    autosaveSchedulerRef.current?.schedule({
+    projectLifecycle.scheduleAutosave({
       projectId: currentProjectId,
-      hydratedProjectId: hydratedProjectIdRef.current,
+      serverOnline,
       editor: {
         segments,
         selected,
@@ -426,12 +408,11 @@ export default function App() {
       },
     });
     return () => autosaveSchedulerRef.current?.cancel();
-  }, [currentProjectId, serverOnline, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, burnSubtitles, insertAd, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity, videoBannerEnabled, videoBannerHeight]);
+  }, [currentProjectId, projectLifecycle, serverOnline, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, burnSubtitles, insertAd, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity, videoBannerEnabled, videoBannerHeight]);
 
   useEffect(() => () => {
-    cancelProjectLoad();
-    cancelProjectAutosave();
-  }, [cancelProjectAutosave, cancelProjectLoad]);
+    projectLifecycle.dispose();
+  }, [projectLifecycle]);
 
   // ── Server health ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -518,70 +499,21 @@ export default function App() {
   const hydrateRecentProject = async (project, { resume = false } = {}) => {
     const projectId = project?.project_id;
     if (!projectId) return;
-    const action = resume ? 'resume' : 'open';
-    let resumeHandedOff = false;
-    setProjectPendingAction({ projectId, action });
     setProjectError('');
-    try {
-      const detail = await loadProjectDetails(projectId);
-      if (!detail) return;
-      if (detail.source_exists === false) {
-        setProjectError(diagnosticMessage(
-          detail.source_diagnostic,
-          'Исходный файл проекта не найден; данные проекта сохранены',
-        ));
-        return;
-      }
-
-      if (resume) {
-        const operationId = detail.transcription?.operation_id;
-        if (!operationId || detail.transcription?.resume_available === false) {
-          setProjectError(diagnosticMessage(
-            detail.transcription?.diagnostic,
-            'Сохранённый прогресс нельзя продолжить',
-          ));
-          return;
-        }
-        resumeHandedOff = true;
-        applyProjectDetails(detail, { resumeOperationId: operationId });
-        return;
-      }
-
-      applyProjectDetails(detail);
-    } catch (loadError) {
-      if (loadError.name !== 'AbortError') setProjectError(loadError.message);
-    } finally {
-      if (!resumeHandedOff) setProjectPendingAction(null);
-    }
+    await projectLifecycle.loadProject(projectId, { resume });
   };
 
-  const handleRestartProject = async (project) => {
+  const handleRestartProject = (project) => {
     const projectId = project?.project_id;
-    if (!projectId) return;
-    setProjectPendingAction({ projectId, action: 'restart' });
+    if (!projectId) return Promise.resolve(null);
     setProjectError('');
-    try {
-      const response = await fetch(`${API}/api/projects/${projectId}/transcription/restart`, {
-        method: 'POST',
-      });
-      const snapshot = await readApiResponse(response);
-      setRecentProjects((projects) => projects.map((item) => (
-        item.project_id === projectId
-          ? { ...item, transcription: snapshot, has_transcript: false }
-          : item
-      )));
-    } catch (restartError) {
-      setProjectError(restartError.message);
-    } finally {
-      setProjectPendingAction(null);
-    }
+    return projectLifecycle.restartProject(projectId);
   };
 
   const handleVideoReady = (videoData, localFileUrl = null) => {
-    cancelProjectLoad();
-    cancelProjectAutosave();
+    projectLifecycle.cancelAll();
     pendingResumeOperationIdRef.current = null;
-    hydratedProjectIdRef.current = videoData.video_id;
+    projectLifecycle.adoptHydratedProject(videoData.video_id);
     setCurrentProjectId(videoData.video_id);
     setHydratedOperation(null);
     setProjectPendingAction(null);
@@ -640,9 +572,7 @@ export default function App() {
   };
 
   const handleResetVideo = () => {
-    cancelProjectLoad();
-    cancelProjectAutosave();
-    hydratedProjectIdRef.current = null;
+    projectLifecycle.cancelAll();
     pendingResumeOperationIdRef.current = null;
     setCurrentProjectId(null);
     setHydratedOperation(null);
@@ -844,15 +774,7 @@ export default function App() {
           padding,
           aspect_ratio: aspectRatio,
           burn_subtitles: burnSubtitles,
-          insert_ad: insertAd,
-          text_ad_enabled: textAdEnabled,
-          text_ad_text: textAdText,
-          text_ad_position: textAdPosition,
-          text_ad_interval: textAdInterval,
-          text_ad_opacity: textAdOpacity,
-          video_banner_enabled: videoBannerEnabled && hasVideoBanner,
-          video_banner_height: videoBannerHeight,
-        }),
+          insert_ad: insertAd,        }),
       });
       const data = await readApiResponse(r);
       const clips = data.clips || [];
@@ -898,15 +820,7 @@ export default function App() {
           padding: exportPadding,
           aspect_ratio: aspectRatio,
           burn_subtitles: burnSubtitles,
-          insert_ad: insertAd,
-          text_ad_enabled: textAdEnabled,
-          text_ad_text: textAdText,
-          text_ad_position: textAdPosition,
-          text_ad_interval: textAdInterval,
-          text_ad_opacity: textAdOpacity,
-          video_banner_enabled: videoBannerEnabled && hasVideoBanner,
-          video_banner_height: videoBannerHeight,
-        }),
+          insert_ad: insertAd,        }),
       });
       const data = await readApiResponse(r);
       setClipResults(data.clips || []);
@@ -945,13 +859,15 @@ export default function App() {
               </div>
             ))}
 
-            <RecentProjects
-              projects={recentProjects}
-              pendingAction={projectPendingAction}
-              onOpen={(project) => hydrateRecentProject(project)}
-              onResume={(project) => hydrateRecentProject(project, { resume: true })}
-              onRestart={handleRestartProject}
-            />
+            {showRecentProjects && (
+              <RecentProjects
+                projects={recentProjects}
+                pendingAction={projectPendingAction}
+                onOpen={(project) => hydrateRecentProject(project)}
+                onResume={(project) => hydrateRecentProject(project, { resume: true })}
+                onRestart={handleRestartProject}
+              />
+            )}
 
             <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
               <button
