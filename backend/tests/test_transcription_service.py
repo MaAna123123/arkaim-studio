@@ -43,8 +43,10 @@ class FakeProjectStore:
         self.status_provider = None
         self.status_at_remove = []
 
-    def save_checkpoint(self, project_id, checkpoint):
+    def save_checkpoint(self, project_id, checkpoint, *, is_current=None):
         saved = copy.deepcopy(checkpoint)
+        if is_current is not None and not is_current():
+            return None
         self.checkpoints[project_id] = saved
         self.calls.append(("save_checkpoint", project_id, saved))
         return copy.deepcopy(saved)
@@ -74,6 +76,30 @@ class FakeProjectStore:
 
     def source_status(self, _project_id):
         return {"exists": True, "diagnostic": None}
+
+
+class BlockingPredecessorCheckpointStore(FakeProjectStore):
+    """Pauses a retiring worker at the real checkpoint-store write boundary."""
+
+    def __init__(self):
+        super().__init__()
+        self.block_operation_id = None
+        self.predecessor_write_blocked = threading.Event()
+        self.release_predecessor_write = threading.Event()
+        self.predecessor_write_finished = threading.Event()
+
+    def save_checkpoint(self, project_id, checkpoint, *, is_current=None):
+        saved = copy.deepcopy(checkpoint)
+        if saved["operation_id"] == self.block_operation_id:
+            self.predecessor_write_blocked.set()
+            if not self.release_predecessor_write.wait(1.0):
+                raise TimeoutError("predecessor checkpoint write was not released")
+            self.predecessor_write_finished.set()
+        if is_current is not None and not is_current():
+            return None
+        self.checkpoints[project_id] = saved
+        self.calls.append(("save_checkpoint", project_id, saved))
+        return copy.deepcopy(saved)
 
 
 class ControllableTranscriber:
@@ -491,6 +517,53 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
             service.manager.get(operation["operation_id"])["partial_result"],
             transcriber.returned_result,
         )
+
+    async def test_restart_replacement_keeps_checkpoint_when_retiring_write_releases(self):
+        store = BlockingPredecessorCheckpointStore()
+        transcriber = StopReturnTranscriber(emit_partial=True)
+        service = TranscriptionService(
+            OperationManager(), transcriber, self.publish, store
+        )
+        store.status_provider = lambda: service.manager.list_operations(
+            video_id="video-1"
+        )[0]["status"]
+        loop = asyncio.get_running_loop()
+        predecessor = service.start(
+            "video-1", "video.mp4", None, self.transcript_path, loop
+        )
+        await self.assert_event_set(transcriber.partial_emitted)
+
+        replacement = None
+        store.block_operation_id = predecessor["operation_id"]
+        service.stop(predecessor["operation_id"])
+        await self.assert_event_set(store.predecessor_write_blocked)
+        try:
+            replacement = service.restart_from_zero(
+                "video-1",
+                "video.mp4",
+                None,
+                self.transcript_path,
+                loop,
+                predecessor["operation_id"],
+            )
+            self.assertEqual(
+                store.checkpoints["video-1"]["operation_id"],
+                replacement["operation_id"],
+            )
+
+            store.release_predecessor_write.set()
+            await self.assert_event_set(store.predecessor_write_finished)
+            self.assertEqual(
+                store.checkpoints["video-1"]["operation_id"],
+                replacement["operation_id"],
+            )
+        finally:
+            store.release_predecessor_write.set()
+            if replacement is not None:
+                current = service.manager.get(replacement["operation_id"])
+                if current and current["status"] in {"queued", "running", "paused"}:
+                    service.stop(replacement["operation_id"])
+            await service.shutdown(timeout=0.5)
 
     async def test_retiring_worker_cannot_replace_retained_state_after_resume(self):
         service = ValidationInterleavingService(

@@ -76,6 +76,7 @@ class TranscriptionService:
                     "transcript_path": Path(transcript_path),
                     "loop": loop,
                     "generation": 1,
+                    "checkpoint_lease": self._new_checkpoint_lease(),
                 },
             )
             already_scheduled = operation_id in self._futures
@@ -119,6 +120,9 @@ class TranscriptionService:
                     previous_operation_id
                 )
                 previous_metadata = self._metadata.get(previous_operation_id)
+                previous_lease = (previous_metadata or {}).get("checkpoint_lease")
+                if previous_lease is not None:
+                    previous_lease.clear()
                 self._metadata.pop(previous_operation_id, None)
             else:
                 operation = self.manager.create("transcription", video_id)
@@ -127,6 +131,7 @@ class TranscriptionService:
 
             operation_id = operation["operation_id"]
             launch_gate = threading.Event()
+            checkpoint_lease = self._new_checkpoint_lease()
             self._video_operations[key] = operation_id
             self._metadata[operation_id] = {
                 "video_path": video_path,
@@ -134,6 +139,7 @@ class TranscriptionService:
                 "transcript_path": Path(transcript_path),
                 "loop": loop,
                 "generation": 1,
+                "checkpoint_lease": checkpoint_lease,
                 "launch_gate": launch_gate,
                 "checkpoint_committed": False,
             }
@@ -149,7 +155,12 @@ class TranscriptionService:
             checkpoint = self.manager.get(operation_id)
             if checkpoint is None:
                 raise RuntimeError("Replacement operation disappeared before commit")
-            self.project_store.save_checkpoint(video_id, checkpoint)
+            if self.project_store.save_checkpoint(
+                video_id,
+                checkpoint,
+                is_current=checkpoint_lease.is_set,
+            ) is None:
+                raise RuntimeError("Replacement checkpoint ownership was superseded")
         except Exception:
             self._rollback_uncommitted_restart(
                 operation_id,
@@ -183,6 +194,9 @@ class TranscriptionService:
                 restored = self.manager.rollback_replacement(previous, operation_id)
                 self._video_operations[key] = restored["operation_id"]
                 if previous_metadata is not None:
+                    previous_lease = previous_metadata.get("checkpoint_lease")
+                    if previous_lease is not None:
+                        previous_lease.set()
                     self._metadata[restored["operation_id"]] = previous_metadata
             else:
                 self.manager.discard(operation_id)
@@ -254,6 +268,7 @@ class TranscriptionService:
                     "transcript_path": transcript_path,
                     "loop": None,
                     "generation": 1,
+                    "checkpoint_lease": self._new_checkpoint_lease(),
                 }
                 restored = self.manager.restore(checkpoint)
                 if restored is None:
@@ -374,6 +389,12 @@ class TranscriptionService:
                     )
                 self._metadata[operation_id]["loop"] = loop
                 self._metadata[operation_id]["generation"] += 1
+                previous_lease = self._metadata[operation_id].get("checkpoint_lease")
+                if previous_lease is not None:
+                    previous_lease.clear()
+                self._metadata[operation_id]["checkpoint_lease"] = (
+                    self._new_checkpoint_lease()
+                )
                 generation = self._metadata[operation_id]["generation"]
                 snapshot = self.manager.transition(operation_id, "running")
                 snapshot = self.manager.update(operation_id, pending_action=None)
@@ -519,7 +540,7 @@ class TranscriptionService:
                 operation_id,
                 partial_result=copy.deepcopy(partial),
             )
-            self._persist_checkpoint(operation_id)
+            self._persist_checkpoint(operation_id, generation)
             self._publish_snapshot(operation_id, loop)
 
         def on_control_state(state: str) -> None:
@@ -538,7 +559,7 @@ class TranscriptionService:
                 else:
                     return
                 self.manager.update(operation_id, pending_action=None)
-            self._persist_checkpoint(operation_id)
+            self._persist_checkpoint(operation_id, generation)
             self._publish_snapshot(operation_id, loop)
 
         try:
@@ -561,7 +582,7 @@ class TranscriptionService:
                     )
                     latest = self.manager.get(operation_id)
                 if not result.get("is_complete") and latest["status"] == "stopped":
-                    self._persist_checkpoint(operation_id)
+                    self._persist_checkpoint(operation_id, generation)
             if result.get("is_complete") and latest.get("pending_action") == "stop":
                 on_control_state("stopped")
                 self._publish_snapshot(operation_id, loop)
@@ -638,15 +659,31 @@ class TranscriptionService:
                 latest = self.manager.get(operation_id)
                 if latest and latest["status"] in {"queued", "running", "paused"}:
                     self.manager.transition(operation_id, "failed")
-                self._persist_checkpoint(operation_id)
+                self._persist_checkpoint(operation_id, generation)
                 self._publish_snapshot(operation_id, loop)
 
-    def _persist_checkpoint(self, operation_id: str) -> None:
+    def _persist_checkpoint(self, operation_id: str, generation: int) -> None:
         if self.project_store is None:
             return
         snapshot = self.manager.get(operation_id)
-        if snapshot is not None:
-            self.project_store.save_checkpoint(snapshot["video_id"], snapshot)
+        with self._lock:
+            metadata = self._metadata.get(operation_id)
+            if (
+                snapshot is None
+                or metadata is None
+                or metadata["generation"] != generation
+            ):
+                return
+            checkpoint_lease = metadata["checkpoint_lease"]
+        self.project_store.save_checkpoint(
+            snapshot["video_id"], snapshot, is_current=checkpoint_lease.is_set
+        )
+
+    @staticmethod
+    def _new_checkpoint_lease() -> threading.Event:
+        lease = threading.Event()
+        lease.set()
+        return lease
 
     def _operation_action_lock(self, operation_id: str) -> threading.Lock:
         with self._lock:

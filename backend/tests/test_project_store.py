@@ -552,6 +552,19 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.load_checkpoint(self.video_id))
         self.assertFalse(self.store.remove_checkpoint(self.video_id))
 
+    def test_checkpoint_write_is_skipped_when_writer_loses_ownership(self):
+        self.create_project()
+        retained = {"operation_id": "retained", "status": "stopped"}
+        stale = {"operation_id": "stale", "status": "stopped"}
+        self.store.save_checkpoint(self.video_id, retained)
+
+        saved = self.store.save_checkpoint(
+            self.video_id, stale, is_current=lambda: False
+        )
+
+        self.assertIsNone(saved)
+        self.assertEqual(self.store.load_checkpoint(self.video_id), retained)
+
     def test_final_transcript_strips_incomplete_fields_from_saved_and_loaded_payloads(self):
         self.create_project()
         transcript = {

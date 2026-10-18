@@ -10,7 +10,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 
@@ -556,14 +556,22 @@ class ProjectStore:
         self._validate_project_schema(project, normalized_id)
         return normalized_id, project_directory
 
-    def save_checkpoint(self, project_id: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
-        """Persist the complete recoverable transcription snapshot for a project."""
+    def save_checkpoint(
+        self,
+        project_id: str,
+        checkpoint: dict[str, Any],
+        *,
+        is_current: Callable[[], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist a checkpoint only while its caller still owns the project."""
         if not isinstance(checkpoint, dict):
             raise ValueError("checkpoint must be an object")
         normalized_id = self._validate_id(project_id)
         with self._project_lock(normalized_id):
             _, project_directory = self._require_project(normalized_id)
             saved = copy.deepcopy(checkpoint)
+            if is_current is not None and not is_current():
+                return None
             self._atomic_write_json(project_directory / "checkpoint.json", saved)
         return saved
 
