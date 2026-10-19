@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import tempfile
 import threading
 import uuid
@@ -130,6 +131,18 @@ class ProjectStore:
             return candidate.relative_to(self.project_root).as_posix()
         except ValueError as exc:
             raise ValueError("source_path must stay below the project root") from exc
+
+    def _stored_source_path(self, source_path: str | Path) -> Path:
+        """Validate a stored relative path without following its final symlink."""
+        raw_path = Path(source_path)
+        if not str(source_path) or raw_path.is_absolute():
+            raise ValueError("stored source_path must be relative")
+        normalized = Path(os.path.abspath(self.project_root / raw_path))
+        try:
+            normalized.relative_to(self.project_root)
+        except ValueError as exc:
+            raise ValueError("source_path must stay below the project root") from exc
+        return normalized
 
     @staticmethod
     def _safe_scalar(value: Any) -> bool:
@@ -387,6 +400,26 @@ class ProjectStore:
             project["updated_at"] = self._utc_now()
             self._atomic_write_json(destination, project)
         return self.get_project(normalized_id)
+
+    def delete_project(self, project_id: str) -> None:
+        """Permanently remove one project record and its owned source file."""
+        normalized_id = self._validate_id(project_id)
+        project_directory = self._project_dir(normalized_id)
+        with self._project_lock(normalized_id):
+            project = self._read_json(project_directory / "project.json")
+            self._validate_project_schema(project, normalized_id)
+            source_path = self._stored_source_path(project.get("source_path"))
+            if source_path.is_symlink():
+                source_path.unlink()
+            else:
+                resolved_source = source_path.resolve()
+                resolved_source.relative_to(self.project_root)
+                if resolved_source.is_file():
+                    resolved_source.unlink()
+            shutil.rmtree(project_directory)
+
+        with self._locks_guard:
+            self._locks.pop(normalized_id, None)
 
     def source_status(self, project_id: str) -> dict[str, Any]:
         """Report whether a stored source path still resolves to a regular file."""

@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import uuid
 import asyncio
 import urllib.parse
@@ -368,6 +369,84 @@ async def patch_project(project_id: str, payload: dict):
     except (FileNotFoundError, OSError, json.JSONDecodeError,
             UnsupportedProjectSchemaError) as exc:
         raise _project_storage_error(exc) from exc
+
+
+def _delete_project_artifacts(project_id: str) -> None:
+    targets = (
+        (CLIPS_DIR, f"{project_id}_*"),
+        (THUMBS_DIR, f"{project_id}_*"),
+        (TRANSCRIPTS_DIR, f"{project_id}.*"),
+        (TEMP_DIR, f"{project_id}_*"),
+    )
+    for root, pattern in targets:
+        resolved_root = Path(root).resolve()
+        if not resolved_root.is_dir():
+            continue
+        for candidate in resolved_root.glob(pattern):
+            if candidate.is_symlink():
+                candidate.unlink(missing_ok=True)
+                continue
+            if getattr(candidate, "is_junction", lambda: False)():
+                candidate.rmdir()
+                continue
+            resolved_candidate = candidate.resolve()
+            resolved_candidate.relative_to(resolved_root)
+            if resolved_candidate.is_dir():
+                shutil.rmtree(resolved_candidate)
+            else:
+                resolved_candidate.unlink(missing_ok=True)
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    normalized_id = _normalize_project_id(project_id)
+    try:
+        project_store.source_status(normalized_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+    try:
+        transcription_service.begin_video_deletion(normalized_id)
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    project_removed = False
+    try:
+        operation = operation_manager.find_for_video(normalized_id, include_stopped=True)
+        if operation is not None:
+            operation_id = operation["operation_id"]
+            if operation["status"] in {"running", "paused"}:
+                transcription_service.stop(operation_id)
+                await asyncio.wait_for(
+                    transcription_service.wait_for_terminal(operation_id),
+                    timeout=10,
+                )
+            elif operation["status"] in {"queued", "stopped"}:
+                if operation["status"] == "queued":
+                    operation_manager.transition(operation_id, "cancelled")
+            await asyncio.wait_for(
+                transcription_service.wait_for_idle(operation_id),
+                timeout=10,
+            )
+            transcription_service.forget(operation_id)
+        _delete_project_artifacts(normalized_id)
+        project_store.delete_project(normalized_id)
+        project_removed = True
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Не удалось безопасно остановить активную транскрипцию",
+        ) from exc
+    except (KeyError, OperationConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+    finally:
+        if not project_removed:
+            transcription_service.abort_video_deletion(normalized_id)
+    return {"deleted": True, "project_id": normalized_id}
 
 
 @app.post("/api/projects/{project_id}/transcription/restart")

@@ -93,6 +93,48 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertEqual(saved["created_at"], saved["updated_at"])
         self.assertEqual(project, saved)
 
+    def test_delete_project_removes_only_its_record_and_source_file(self):
+        source = self.project_root / "backend" / "uploads" / f"{self.video_id}.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"primary")
+        self.create_project(source_path=source)
+
+        sibling_id = str(uuid.uuid4())
+        sibling_source = self.project_root / "backend" / "uploads" / f"{sibling_id}.mp4"
+        sibling_source.write_bytes(b"sibling")
+        self.store.create_project(
+            sibling_id,
+            "Соседний проект",
+            "sibling.mp4",
+            sibling_source,
+            {"duration": 10},
+        )
+
+        self.store.delete_project(self.video_id)
+
+        self.assertFalse(source.exists())
+        self.assertFalse((self.store.projects_root / self.video_id).exists())
+        self.assertTrue(sibling_source.exists())
+        self.assertTrue((self.store.projects_root / sibling_id / "project.json").is_file())
+
+    def test_delete_project_unlinks_source_symlink_without_deleting_its_target(self):
+        source = self.project_root / "backend" / "uploads" / f"{self.video_id}.mp4"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"primary")
+        self.create_project(source_path=source)
+        target = source.with_name("sibling.mp4")
+        target.write_bytes(b"sibling")
+        source.unlink()
+        try:
+            source.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"Symlinks are unavailable: {exc}")
+
+        self.store.delete_project(self.video_id)
+
+        self.assertFalse(source.exists())
+        self.assertTrue(target.exists())
+
     def test_create_project_round_trips_utf8_title_and_safe_video_metadata(self):
         project = self.create_project(
             title="Привет, 世界 👋",

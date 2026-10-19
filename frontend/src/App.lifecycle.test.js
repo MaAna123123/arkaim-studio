@@ -300,6 +300,12 @@ function buttonInCard(card, text) {
   return button;
 }
 
+function buttonByAriaLabel(card, label) {
+  const button = card.findAllByType('button').find((candidate) => candidate.props['aria-label'] === label);
+  assert.ok(button, `expected card button with aria-label: ${label}`);
+  return button;
+}
+
 async function answerRecentProjects(transport, projects) {
   const request = transport.requestsFor('/api/projects').at(-1);
   assert.ok(request, 'the App should request recent projects');
@@ -691,6 +697,39 @@ test('mounted App scopes restart pending state to the project and ignores late r
     true,
     'only the correctly identified restart snapshot updates its project',
   );
+});
+
+test('mounted App removes only the confirmed project card after backend deletion succeeds', async (t) => {
+  const { renderer, transport } = await mountApp(t);
+  const projects = [
+    recentProject('project-a', 'Delete A'),
+    recentProject('project-b', 'Keep B'),
+  ];
+
+  await answerLatestHealth(transport, true);
+  await answerRecentProjects(transport, projects);
+  await act(async () => {
+    buttonInCard(recentProjectCardByTitle(renderer, 'Delete A'), 'Удалить').props.onClick();
+    await flush();
+  });
+
+  const deletion = transport.requestsFor('/api/projects/project-a', 'DELETE')[0];
+  assert.ok(deletion, 'confirmed deletion should use the project endpoint');
+  assert.equal(
+    buttonByAriaLabel(
+      recentProjectCardByTitle(renderer, 'Delete A'),
+      'Удалить проект «Delete A»',
+    ).props.disabled,
+    true,
+    'only the deleting card should be disabled while the request is pending',
+  );
+  await answerDetail(deletion, { deleted: true, project_id: 'project-a' });
+
+  assert.equal(
+    renderer.root.findAllByType('h3').some((heading) => heading.props.title === 'Delete A'),
+    false,
+  );
+  assert.ok(recentProjectCardByTitle(renderer, 'Keep B'));
 });
 
 for (const invalidRestart of [

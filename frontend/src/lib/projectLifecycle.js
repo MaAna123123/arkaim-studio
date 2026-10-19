@@ -31,6 +31,7 @@ export function createProjectLifecycleController({
   clearMissingProject = () => {},
   receiveRecentProjects = () => {},
   receiveRestart = () => {},
+  receiveDelete = () => {},
   setPendingAction = () => {},
   setError = () => {},
 }) {
@@ -41,6 +42,8 @@ export function createProjectLifecycleController({
   let listGeneration = 0;
   let restartController = null;
   let restartGeneration = 0;
+  let deleteController = null;
+  let deleteGeneration = 0;
   let pendingToken = null;
   let nextPendingId = 1;
 
@@ -79,6 +82,13 @@ export function createProjectLifecycleController({
     restartController?.abort();
     restartController = null;
     if (pendingToken?.action === 'restart') clearPending(pendingToken);
+  };
+
+  const cancelDelete = () => {
+    deleteGeneration += 1;
+    deleteController?.abort();
+    deleteController = null;
+    if (pendingToken?.action === 'delete') clearPending(pendingToken);
   };
 
   const prepareProjectTransition = () => {
@@ -222,6 +232,45 @@ export function createProjectLifecycleController({
     })();
   };
 
+  const deleteProject = (projectId) => {
+    if (!projectId) return Promise.resolve(null);
+    if (deleteController) return Promise.resolve(null);
+    cancelDetail();
+    cancelRestart();
+    cancelRecent();
+    cancelAutosave();
+    const token = beginPending(projectId, 'delete');
+    const generation = deleteGeneration;
+    const controller = new AbortController();
+    deleteController = controller;
+    return (async () => {
+      try {
+        const response = await fetchImpl(`${apiBase}/api/projects/${projectId}`, {
+          method: 'DELETE',
+          signal: controller.signal,
+        });
+        const result = await readResponse(response);
+        if (generation !== deleteGeneration || deleteController !== controller) return null;
+        if (result?.deleted !== true || result?.project_id !== projectId) {
+          throw new Error('Ответ удаления не соответствует выбранному проекту');
+        }
+        if (hydratedProjectId === projectId) hydratedProjectId = null;
+        receiveDelete(projectId);
+        return result;
+      } catch (error) {
+        if (
+          !isAbortError(error)
+          && generation === deleteGeneration
+          && deleteController === controller
+        ) setError(error.message);
+        return null;
+      } finally {
+        if (deleteController === controller) deleteController = null;
+        clearPending(token);
+      }
+    })();
+  };
+
   const cancelAll = () => {
     cancelDetail();
     cancelRestart();
@@ -234,6 +283,7 @@ export function createProjectLifecycleController({
   return {
     loadProject,
     restartProject,
+    deleteProject,
     syncRecentProjects,
     cancelRecent,
     cancelDetail,
@@ -255,6 +305,7 @@ export function createProjectLifecycleController({
     cancelAll,
     dispose() {
       cancelAll();
+      cancelDelete();
     },
   };
 }

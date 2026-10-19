@@ -311,6 +311,11 @@ export default function App({ recentProjectsOverride = null } = {}) {
             : item
         )));
       },
+      receiveDelete: (projectId) => {
+        setRecentProjects((projects) => projects.filter((item) => item.project_id !== projectId));
+        setProjectDiagnostics((diagnostics) => diagnostics.filter((item) => item.project_id !== projectId));
+        if (selectedVideoIdRef.current === projectId) handleResetVideo();
+      },
       setPendingAction: setProjectPendingAction,
       setError: setProjectError,
     });
@@ -547,6 +552,13 @@ export default function App({ recentProjectsOverride = null } = {}) {
     if (!projectId) return Promise.resolve(null);
     setProjectError('');
     return projectLifecycle.restartProject(projectId);
+  };
+
+  const handleDeleteProject = (project) => {
+    const projectId = project?.project_id;
+    if (!projectId) return Promise.resolve(null);
+    setProjectError('');
+    return projectLifecycle.deleteProject(projectId);
   };
 
   const handleVideoReady = (videoData, localFileUrl = null) => {
@@ -957,6 +969,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
                 onOpen={(project) => hydrateRecentProject(project)}
                 onResume={(project) => hydrateRecentProject(project, { resume: true })}
                 onRestart={handleRestartProject}
+                onDelete={handleDeleteProject}
               />
             )}
 
