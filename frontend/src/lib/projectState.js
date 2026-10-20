@@ -1,3 +1,4 @@
+import { normalizeComposition } from './clipComposition.js';
 const DEFAULT_EDITOR_STATE = {
   segments: [],
   selected: [],
@@ -43,12 +44,34 @@ function booleanOrDefault(value, fallback) {
   return typeof value === 'boolean' ? value : fallback;
 }
 
+function normalizeSegments(value, sourceDuration) {
+  return listOrEmpty(value).map((item) => {
+    const segment = cloneProjectValue(objectOrEmpty(item));
+    if (segment.composition == null) return segment;
+    const composition = normalizeComposition(segment.composition, segment, sourceDuration);
+    if (composition) {
+      return {
+        ...segment,
+        start: composition.source_start,
+        end: composition.source_end,
+        composition,
+      };
+    }
+    delete segment.composition;
+    return segment;
+  });
+}
+
 export function mapProjectToEditorState(project) {
   const source = objectOrEmpty(project);
   const editor = objectOrEmpty(source.editor);
   const savedVideo = cloneProjectValue(objectOrEmpty(source.video));
   const videoId = source.video_id ?? source.project_id ?? savedVideo.video_id;
   const title = source.title ?? savedVideo.title;
+  const sourceDuration = numberOrDefault(
+    objectOrEmpty(savedVideo.metadata).duration,
+    numberOrDefault(savedVideo.duration, 0),
+  );
   const video = videoId || title || Object.keys(savedVideo).length
     ? { ...savedVideo, ...(videoId ? { video_id: videoId } : {}), ...(title ? { title } : {}) }
     : null;
@@ -63,7 +86,7 @@ export function mapProjectToEditorState(project) {
     subtitleNotice: typeof editor.subtitle_notice === 'string'
       ? editor.subtitle_notice
       : DEFAULT_EDITOR_STATE.subtitle_notice,
-    segments: cloneProjectValue(listOrEmpty(editor.segments)),
+    segments: normalizeSegments(editor.segments, sourceDuration),
     selected: new Set(cloneProjectValue(listOrEmpty(editor.selected))),
     clipResults: cloneProjectValue(listOrEmpty(editor.clip_results)),
     exportPadding: numberOrDefault(editor.export_padding, DEFAULT_EDITOR_STATE.export_padding),

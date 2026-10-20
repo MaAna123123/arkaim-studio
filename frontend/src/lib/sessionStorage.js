@@ -2,6 +2,15 @@ const SESSION_KEY = 'videopril.session.v1';
 
 const PROJECT_AUTOSAVE_DELAY_MS = 700;
 
+function cloneEditorValue(value) {
+  if (Array.isArray(value)) return value.map(cloneEditorValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, cloneEditorValue(item)]),
+    );
+  }
+  return value;
+}
 
 export function buildHydratedProjectVideo(project, mappedVideo) {
   const source = mappedVideo && typeof mappedVideo === 'object' ? mappedVideo : {};
@@ -29,7 +38,7 @@ export function buildHydratedProjectVideo(project, mappedVideo) {
 
 export function buildProjectEditorPatch(editor = {}) {
   return {
-    segments: editor.segments,
+    segments: cloneEditorValue(editor.segments),
     selected: editor.selected instanceof Set ? [...editor.selected] : editor.selected,
     clip_results: editor.clipResults,
     subtitle_context: editor.subtitleContext,

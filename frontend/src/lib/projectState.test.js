@@ -6,6 +6,7 @@ import {
   getProjectCardState,
   mapProjectToEditorState,
 } from './projectState.js';
+import { createDefaultComposition } from './clipComposition.js';
 
 
 test('project details hydrate the editor with a Set selection and saved options', () => {
@@ -105,6 +106,45 @@ test('project hydration returns independent mutable editor data', () => {
   assert.equal(project.editor.clip_results[0].metadata.size, 12);
   assert.equal(project.editor.subtitle_context.source.language, 'ru');
   assert.equal(project.transcription.partial_result.checkpoint, 12);
+});
+
+test('project hydration normalizes independent per-clip compositions', () => {
+  const firstComposition = createDefaultComposition({ start: 4, end: 8 }, '9:16');
+  const secondComposition = createDefaultComposition({ start: 20, end: 30 }, '9:16');
+  secondComposition.main_layer.destination = { x: 0, y: 0.3, width: 1, height: 0.7 };
+  const project = {
+    video: { metadata: { duration: 90 } },
+    editor: {
+      segments: [
+        { start: 4, end: 8, composition: firstComposition },
+        { start: 20, end: 30, composition: secondComposition },
+      ],
+    },
+  };
+
+  const state = mapProjectToEditorState(project);
+  state.segments[0].composition.main_layer.destination.y = 0.4;
+
+  assert.equal(state.segments[1].composition.main_layer.destination.y, 0.3);
+  assert.equal(project.editor.segments[0].composition.main_layer.destination.y, 0);
+});
+
+test('malformed saved composition is dropped without losing its segment', () => {
+  const state = mapProjectToEditorState({
+    video: { duration: 60 },
+    editor: {
+      segments: [{
+        start: 4,
+        end: 8,
+        label: 'Legacy moment',
+        composition: { source_start: 8, source_end: 4 },
+      }],
+    },
+  });
+
+  assert.equal(state.segments.length, 1);
+  assert.equal(state.segments[0].label, 'Legacy moment');
+  assert.equal('composition' in state.segments[0], false);
 });
 
 test('missing source wins card precedence while details remain available', () => {

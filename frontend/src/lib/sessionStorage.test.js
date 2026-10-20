@@ -10,6 +10,7 @@ import {
   loadSession,
   saveSession,
 } from './sessionStorage.js';
+import { createDefaultComposition } from './clipComposition.js';
 
 
 function memoryStorage(initial = {}) {
@@ -29,6 +30,25 @@ test('session helpers round-trip editor state in the current tab', () => {
   });
   clearSession(storage);
   assert.deepEqual(loadSession(storage), {});
+});
+
+test('session and autosave payloads deep-copy independent clip compositions', () => {
+  const storage = memoryStorage();
+  const editor = {
+    segments: [
+      { start: 1, end: 5, composition: createDefaultComposition({ start: 1, end: 5 }, '9:16') },
+      { start: 10, end: 20, composition: createDefaultComposition({ start: 10, end: 20 }, '9:16') },
+    ],
+  };
+
+  saveSession(storage, editor);
+  const restored = loadSession(storage);
+  const patch = buildProjectEditorPatch(editor);
+  restored.segments[0].composition.main_layer.crop.x = 0.2;
+  patch.segments[1].composition.main_layer.destination.y = 0.3;
+
+  assert.equal(editor.segments[0].composition.main_layer.crop.x, 0);
+  assert.equal(editor.segments[1].composition.main_layer.destination.y, 0);
 });
 
 test('invalid stored data is discarded safely', () => {

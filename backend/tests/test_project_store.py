@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import sys
@@ -241,6 +242,37 @@ class ProjectStoreTests(unittest.TestCase):
         self.assertEqual(saved["editor"]["aspect_ratio"], "9:16")
         self.assertEqual(saved["editor"]["selected"], [])
         self.assertEqual(saved["updated_at"], "2026-10-17T12:00:00Z")
+
+    def test_update_editor_round_trips_independent_clip_compositions(self):
+        self.create_project()
+        first = {
+            "source_start": 1,
+            "source_end": 5,
+            "output_aspect_ratio": "9:16",
+            "main_layer": {
+                "crop": {"x": 0, "y": 0, "width": 1, "height": 1},
+                "destination": {"x": 0, "y": 0, "width": 1, "height": 1},
+                "fit": "cover",
+            },
+            "banner_layer": None,
+            "ad_layer": None,
+        }
+        second = copy.deepcopy(first)
+        second["source_start"] = 10
+        second["source_end"] = 20
+        second["main_layer"]["destination"] = {"x": 0, "y": 0.3, "width": 1, "height": 0.7}
+
+        updated = self.store.update_editor(self.video_id, {
+            "segments": [
+                {"start": 1, "end": 5, "composition": first},
+                {"start": 10, "end": 20, "composition": second},
+            ],
+        })
+        updated["editor"]["segments"][0]["composition"]["main_layer"]["crop"]["x"] = 0.2
+        saved = self.store.get_project(self.video_id)
+
+        self.assertEqual(saved["editor"]["segments"][0]["composition"]["main_layer"]["crop"]["x"], 0)
+        self.assertEqual(saved["editor"]["segments"][1]["composition"]["main_layer"]["destination"]["y"], 0.3)
 
     def test_update_editor_rejects_unknown_path_and_identity_fields(self):
         self.create_project()
