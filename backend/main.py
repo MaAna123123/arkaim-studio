@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -1396,9 +1397,14 @@ async def export_clips(req: ExportRequest):
         raise HTTPException(status_code=400, detail="Неизвестный режим экспорта")
     if req.aspect_ratio not in {"original", "9:16"}:
         raise HTTPException(status_code=400, detail="Неизвестный формат кадра")
+    source_meta = await asyncio.to_thread(processor.extract_metadata, str(video_path))
+    source_duration = float(source_meta.get("duration") or 0)
+    segments = [validate_composition_for_source(segment, source_duration) for segment in segments]
     for segment in segments:
         try:
-            if float(segment["start"]) < 0 or float(segment["end"]) <= float(segment["start"]):
+            start = float(segment["start"])
+            end = float(segment["end"])
+            if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
                 raise ValueError
         except (KeyError, TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Некорректные таймкоды фрагмента")
@@ -1435,6 +1441,40 @@ async def export_clips(req: ExportRequest):
     )
     return {"clips": results}
 
+
+def _current_uploaded_video(directory: Path, prefix: str) -> Path | None:
+    for ext in (".mp4", ".mkv", ".mov", ".webm", ".avi"):
+        candidate = directory / f"{prefix}{ext}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def validate_composition_for_source(segment: dict, source_duration: float) -> dict:
+    """Validate source-dependent composition rules before creating output files."""
+    composition = segment.get("composition")
+    if not composition:
+        return segment
+    try:
+        start = float(composition["source_start"])
+        end = float(composition["source_end"])
+        if not math.isfinite(source_duration) or source_duration <= 0:
+            raise ValueError("Не удалось определить длительность исходного видео")
+        if start < 0 or end <= start or end > source_duration + 0.001:
+            raise ValueError("Границы клипа выходят за пределы исходного видео")
+        if abs(float(segment["start"]) - start) > 0.001 or abs(float(segment["end"]) - end) > 0.001:
+            raise ValueError("Границы клипа не совпадают с настройками композиции")
+        banner = composition.get("banner_layer")
+        if banner and banner.get("enabled", True) and _current_uploaded_video(BANNER_DIR, "current_banner") is None:
+            raise ValueError("Видео-баннер не найден — загрузите его заново")
+        ad = composition.get("ad_layer")
+        if ad and ad.get("enabled", True) and _current_uploaded_video(ADS_DIR, "current_ad") is None:
+            raise ValueError("Видео-реклама не найдена — загрузите её заново")
+    except (KeyError, TypeError, ValueError) as exc:
+        detail = str(exc) or "Некорректные настройки композиции клипа"
+        raise HTTPException(status_code=422, detail=detail) from exc
+    return segment
+
 # ─────────────────────────────────────────────
 # Ad Management
 # ─────────────────────────────────────────────
@@ -1462,6 +1502,8 @@ async def upload_ad(file: UploadFile = File(...)):
             "success": True,
             "filename": file.filename,
             "duration": meta.get("duration", 0),
+            "width": meta.get("width", 0),
+            "height": meta.get("height", 0),
             "size_bytes": meta.get("size_bytes", 0),
             "url": f"/ads/{ad_path.name}",
         }
@@ -1484,6 +1526,8 @@ async def get_current_ad():
                     "has_ad": True,
                     "filename": f"current_ad{ext}",
                     "duration": meta.get("duration", 0),
+                    "width": meta.get("width", 0),
+                    "height": meta.get("height", 0),
                     "size_bytes": meta.get("size_bytes", 0),
                     "url": f"/ads/current_ad{ext}",
                 }
@@ -1530,6 +1574,8 @@ async def upload_banner(file: UploadFile = File(...)):
             "success": True,
             "filename": file.filename,
             "duration": meta.get("duration", 0),
+            "width": meta.get("width", 0),
+            "height": meta.get("height", 0),
             "size_bytes": meta.get("size_bytes", 0),
             "url": f"/banners/{banner_path.name}",
         }
@@ -1552,6 +1598,8 @@ async def get_current_banner():
                     "has_banner": True,
                     "filename": f"current_banner{ext}",
                     "duration": meta.get("duration", 0),
+                    "width": meta.get("width", 0),
+                    "height": meta.get("height", 0),
                     "size_bytes": meta.get("size_bytes", 0),
                     "url": f"/banners/current_banner{ext}",
                 }

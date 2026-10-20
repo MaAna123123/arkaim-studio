@@ -635,5 +635,70 @@ class StartupRecoveryApiTests(unittest.TestCase):
         self.assertEqual(self.transcriber.calls, [])
 
 
+class CompositionExportValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(dir=main.TEMP_DIR)
+        self.root = Path(self.temp_dir.name)
+        self.banner_dir = self.root / "banners"
+        self.ad_dir = self.root / "ads"
+        self.banner_dir.mkdir()
+        self.ad_dir.mkdir()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def segment(start=0.0, end=60.0):
+        return {
+            "start": start,
+            "end": end,
+            "label": "Edited",
+            "composition": {
+                "source_start": start,
+                "source_end": end,
+                "output_aspect_ratio": "9:16",
+                "main_layer": {
+                    "crop": {"x": 0, "y": 0, "width": 1, "height": 1},
+                    "destination": {"x": 0, "y": 0, "width": 1, "height": 1},
+                    "fit": "cover",
+                },
+            },
+        }
+
+    def test_exact_source_boundaries_are_accepted(self):
+        segment = self.segment(0.0, 60.0)
+
+        validated = main.validate_composition_for_source(segment, 60.0)
+
+        self.assertIs(validated, segment)
+
+    def test_source_range_past_duration_is_rejected_in_russian(self):
+        with self.assertRaises(main.HTTPException) as raised:
+            main.validate_composition_for_source(self.segment(0.0, 60.1), 60.0)
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("исходного видео", raised.exception.detail)
+
+    def test_missing_enabled_banner_and_ad_are_rejected(self):
+        for layer_name, layer in (
+            ("banner_layer", {"enabled": True}),
+            ("ad_layer", {"enabled": True, "mode": "overlay"}),
+        ):
+            segment = self.segment()
+            segment["composition"][layer_name] = layer
+            with (
+                patch.object(main, "BANNER_DIR", self.banner_dir),
+                patch.object(main, "ADS_DIR", self.ad_dir),
+                self.assertRaises(main.HTTPException) as raised,
+            ):
+                main.validate_composition_for_source(segment, 60.0)
+            self.assertEqual(raised.exception.status_code, 422)
+
+    def test_legacy_segment_remains_valid_without_composition(self):
+        segment = {"start": 1.0, "end": 2.0, "label": "Legacy"}
+
+        self.assertIs(main.validate_composition_for_source(segment, 60.0), segment)
+
+
 if __name__ == "__main__":
     unittest.main()

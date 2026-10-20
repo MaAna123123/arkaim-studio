@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { toEditorMedia } from '../lib/mediaAsset.js';
 
 function AdSection({ apiBase, onAdStatusChange }) {
   const [adInfo, setAdInfo] = useState(null);
@@ -13,10 +14,10 @@ function AdSection({ apiBase, onAdStatusChange }) {
       const r = await fetch(`${apiBase}/api/ad/current`);
       const data = await r.json();
       setAdInfo(data);
-      onAdStatusChange?.(data.has_ad);
+      onAdStatusChange?.(toEditorMedia(apiBase, data, 'ad'));
     } catch {
       setAdInfo({ has_ad: false });
-      onAdStatusChange?.(false);
+      onAdStatusChange?.(toEditorMedia(apiBase, { has_ad: false }, 'ad'));
     }
   };
 
@@ -33,7 +34,7 @@ function AdSection({ apiBase, onAdStatusChange }) {
       }
       const data = await r.json();
       setAdInfo({ has_ad: true, ...data });
-      onAdStatusChange?.(true);
+      onAdStatusChange?.(toEditorMedia(apiBase, { has_ad: true, ...data }, 'ad'));
     } catch (err) {
       alert(`Ошибка загрузки рекламы: ${err.message}`);
     } finally {
@@ -46,7 +47,7 @@ function AdSection({ apiBase, onAdStatusChange }) {
     try {
       await fetch(`${apiBase}/api/ad/remove`, { method: 'DELETE' });
       setAdInfo({ has_ad: false });
-      onAdStatusChange?.(false);
+      onAdStatusChange?.(toEditorMedia(apiBase, { has_ad: false }, 'ad'));
     } catch {
       alert('Не удалось удалить рекламный ролик');
     }
@@ -143,10 +144,10 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
       const r = await fetch(`${apiBase}/api/banner/current`);
       const data = await r.json();
       setBannerInfo(data);
-      onBannerStatusChange?.(data.has_banner, 'loaded');
+      onBannerStatusChange?.(toEditorMedia(apiBase, data, 'banner'), 'loaded');
     } catch {
       setBannerInfo({ has_banner: false });
-      onBannerStatusChange?.(false, 'loaded');
+      onBannerStatusChange?.(toEditorMedia(apiBase, { has_banner: false }, 'banner'), 'loaded');
     }
   };
 
@@ -163,7 +164,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
       }
       const data = await r.json();
       setBannerInfo({ has_banner: true, ...data });
-      onBannerStatusChange?.(true, 'uploaded');
+      onBannerStatusChange?.(toEditorMedia(apiBase, { has_banner: true, ...data }, 'banner'), 'uploaded');
     } catch (err) {
       alert(`Ошибка загрузки баннера: ${err.message}`);
     } finally {
@@ -176,7 +177,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
     try {
       await fetch(`${apiBase}/api/banner/remove`, { method: 'DELETE' });
       setBannerInfo({ has_banner: false });
-      onBannerStatusChange?.(false, 'removed');
+      onBannerStatusChange?.(toEditorMedia(apiBase, { has_banner: false }, 'banner'), 'removed');
     } catch {
       alert('Не удалось удалить баннер');
     }

@@ -124,7 +124,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
   const [playerTime, setPlayerTime] = useState(0);
   const [playerSeekTo, setPlayerSeekTo] = useState(null);
   const [insertAd, setInsertAd] = useState(false);
-  const [hasAd, setHasAd] = useState(false);
+  const [adMedia, setAdMedia] = useState(null);
+  const hasAd = Boolean(adMedia?.has_media);
 
   // ── Text Ad Overlay State ──────────────────────────────────────────────────
   const [textAdEnabled, setTextAdEnabled] = useState(false);
@@ -135,7 +136,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
 
   // ── Video Banner State ─────────────────────────────────────────────────────
   const [videoBannerEnabled, setVideoBannerEnabled] = useState(false);
-  const [hasVideoBanner, setHasVideoBanner] = useState(false);
+  const [bannerMedia, setBannerMedia] = useState(null);
+  const hasVideoBanner = Boolean(bannerMedia?.has_media);
   const [videoBannerHeight, setVideoBannerHeight] = useState(380);
 
   const wsRef = useRef(null);
@@ -1140,13 +1142,11 @@ export default function App({ recentProjectsOverride = null } = {}) {
             <div className="glass-card p-24">
               <AdManager
                 apiBase={API}
-                onAdStatusChange={(hasAdStatus) => {
-                  setHasAd(hasAdStatus);
-                }}
-                onBannerStatusChange={(hasBannerStatus, source) => {
-                  setHasVideoBanner(hasBannerStatus);
+                onAdStatusChange={setAdMedia}
+                onBannerStatusChange={(media, source) => {
+                  setBannerMedia(media);
                   if (source === 'uploaded') setVideoBannerEnabled(true);
-                  if (!hasBannerStatus) setVideoBannerEnabled(false);
+                  if (!media?.has_media) setVideoBannerEnabled(false);
                 }}
               />
             </div>
@@ -1175,6 +1175,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
           duration={video?.metadata?.duration || video?.duration || 0}
           sourceUrl={videoUrl}
           outputAspectRatio={aspectRatio}
+          bannerMedia={bannerMedia}
+          adMedia={adMedia}
           transcript={transcript}
           onSave={handleSaveSegment}
           onCancel={() => setEditingIdx(null)}
