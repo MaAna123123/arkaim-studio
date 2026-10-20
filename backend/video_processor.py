@@ -15,6 +15,8 @@ import tempfile
 import textwrap
 from pathlib import Path
 
+from clip_compositor import build_composition_filter
+
 
 class VideoProcessor:
     def check_ffmpeg(self) -> bool:
@@ -98,7 +100,10 @@ class VideoProcessor:
         return urls
 
     # ─── Subtitle ASS Generator ───────────────────────────────────────────────
-    def _create_ass_subtitles(self, words: list[dict], t_start: float, t_end: float) -> str:
+    def _create_ass_subtitles(
+        self, words: list[dict], t_start: float, t_end: float,
+        play_res_x: int = 720, play_res_y: int = 1280,
+    ) -> str:
         """Generates temporary ASS subtitle file for FFmpeg subtitle filter."""
         clips_dir = Path(__file__).parent.resolve() / "clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
@@ -144,14 +149,20 @@ class VideoProcessor:
                 # Add smooth fade-in and fade-out (\fad(120,120))
                 events.append(f"Dialogue: 0,{fmt_ass(p_start)},{fmt_ass(p_end)},Default,,0,0,0,,{{\\fad(120,120)}}{p_text}")
 
-        ass_header = """[Script Info]
+        resolution_scale = max(1.0, float(play_res_y) / 1280.0)
+        font_size = int(round(38 * resolution_scale))
+        outline = round(3.5 * resolution_scale, 1)
+        shadow = round(2 * resolution_scale, 1)
+        horizontal_margin = int(round(30 * resolution_scale))
+        vertical_margin = int(round(120 * resolution_scale))
+        ass_header = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial Black,38,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,3.5,2,2,30,30,120,1
+Style: Default,Arial Black,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,{outline},{shadow},2,{horizontal_margin},{horizontal_margin},{vertical_margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -362,6 +373,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_banner_enabled: bool = False,
         video_banner_path: str = "",
         video_banner_height: int = 380,
+        composition: dict | None = None,
+        overlay_ad_path: str = "",
     ) -> str:
         """
         Cut a single segment.
@@ -372,8 +385,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         meta = self.extract_metadata(video_path)
         duration = meta["duration"]
 
-        t_start = max(0.0, start - padding)
-        t_end = min(duration, end + padding)
+        if composition:
+            t_start = float(composition["source_start"])
+            t_end = float(composition["source_end"])
+        else:
+            t_start = max(0.0, start - padding)
+            t_end = min(duration, end + padding)
         seg_dur = t_end - t_start
 
         if seg_dur <= 0:
@@ -408,23 +425,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 "x=(w-text_w)/2:y=55"
             )
 
+        composition_vertical = bool(composition and composition.get("output_aspect_ratio") == "9:16")
+        output_width = 1080 if composition_vertical else (720 if aspect_ratio == "9:16" else int(meta.get("width") or 1280))
+        output_height = 1920 if composition_vertical else (1280 if aspect_ratio == "9:16" else int(meta.get("height") or 720))
+
         if burn_subtitles and words:
             try:
-                temp_ass_file = self._create_ass_subtitles(words, t_start, t_end)
+                temp_ass_file = self._create_ass_subtitles(
+                    words, t_start, t_end, play_res_x=output_width, play_res_y=output_height
+                )
             except Exception:
                 temp_ass_file = None
 
         text_ad_filters = []
         if text_ad_enabled and text_ad_text.strip():
-            clip_w = meta.get("width") or (720 if aspect_ratio == "9:16" else 1280)
-            clip_h = meta.get("height") or (1280 if aspect_ratio == "9:16" else 720)
-            if aspect_ratio == "9:16":
-                clip_w, clip_h = 720, 1280
             text_ad_filters, temp_text_ad_files = self._create_text_ad_filters(
-                text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity, clip_w, clip_h
+                text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity,
+                output_width, output_height,
             )
 
-        needs_encode = (aspect_ratio == "9:16" or temp_ass_file or title_filter or text_ad_filters)
+        needs_encode = (
+            aspect_ratio == "9:16" or temp_ass_file or title_filter or text_ad_filters or composition
+        )
 
         filters = ["setpts=PTS-STARTPTS"]
         if aspect_ratio == "9:16":
@@ -444,16 +466,59 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if text_ad_filters:
             filters.extend(text_ad_filters)
 
+        video_filter_args = ["-vf", ",".join(filters)]
+        video_map_args = []
+        overlay_input_args = []
+        if composition:
+            source_w = int(meta.get("width") or 0)
+            source_h = int(meta.get("height") or 0)
+            if source_w <= 0 or source_h <= 0:
+                raise ValueError("Не удалось определить размер исходного видео")
+
+            next_input = 1
+            banner_input = None
+            banner_layer = composition.get("banner_layer")
+            if banner_layer and banner_layer.get("enabled", True):
+                if not video_banner_path or not os.path.exists(video_banner_path):
+                    raise FileNotFoundError("Видео-баннер для композиции не найден")
+                banner_input = next_input
+                next_input += 1
+                overlay_input_args.extend(["-stream_loop", "-1", "-i", video_banner_path])
+
+            ad_input = None
+            ad_layer = composition.get("ad_layer")
+            if ad_layer and ad_layer.get("enabled", True) and ad_layer.get("mode") == "overlay":
+                if not overlay_ad_path or not os.path.exists(overlay_ad_path):
+                    raise FileNotFoundError("Видео-реклама для композиции не найдена")
+                ad_input = next_input
+                overlay_input_args.extend(["-stream_loop", "-1", "-i", overlay_ad_path])
+
+            post_filters = []
+            if title_filter:
+                post_filters.append(title_filter)
+            if temp_ass_file and os.path.exists(temp_ass_file):
+                escaped_ass = Path(temp_ass_file).as_posix().replace(":", "\\:").replace("'", "\\'")
+                post_filters.append(f"subtitles='{escaped_ass}'")
+            post_filters.extend(text_ad_filters)
+            composition_filter = build_composition_filter(
+                composition, source_w, source_h, output_width, output_height,
+                banner_input, ad_input, post_filters,
+            )
+            video_filter_args = ["-filter_complex", composition_filter.filter_complex]
+            video_map_args = ["-map", composition_filter.video_map, "-map", "0:a?"]
+
         clip_cmd = [
             "ffmpeg",
             "-ss", str(t_start),
             "-i", video_path,
+            *overlay_input_args,
             "-t", str(seg_dur),
-            "-vf", ",".join(filters),
+            *video_filter_args,
+            *video_map_args,
             "-af", "asetpts=PTS-STARTPTS",
             "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "22",
+            "-preset", "medium" if composition else "ultrafast",
+            "-crf", "18" if composition else "22",
             "-pix_fmt", "yuv420p",
             "-threads", "0",
             "-c:a", "aac",
@@ -477,7 +542,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             raise RuntimeError("FFmpeg не создал выходной клип")
 
         # ── Video banner (looping mini-video overlay at top) ─────────────────
-        if video_banner_enabled and video_banner_path and os.path.exists(video_banner_path):
+        if not composition and video_banner_enabled and video_banner_path and os.path.exists(video_banner_path):
             banner_tmp = out_path + "_banner_tmp.mp4"
             try:
                 self.insert_video_banner(
