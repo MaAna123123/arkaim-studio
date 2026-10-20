@@ -244,7 +244,33 @@
 .segment-editor-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; color: var(--text-secondary); font-size: 12px; }
 .segment-editor-footer > div { display: flex; gap: 8px; }
 
-@media (max-width: 760px) { .segment-editor-times { grid-template-columns: 1fr; } .segment-editor-footer { align-items: stretch; flex-direction: column; } }
+.clip-composer-modal { width: min(1180px, calc(100vw - 28px)); max-width: 1180px; max-height: calc(100vh - 24px); overflow-y: auto; }
+.clip-composer-grid { display: grid; grid-template-columns: minmax(310px, 0.82fr) minmax(420px, 1.18fr); gap: 22px; }
+.clip-composer-preview-column { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+.composition-canvas { position: relative; width: min(100%, 360px); aspect-ratio: 9 / 16; overflow: hidden; border: 1px solid rgba(67, 213, 223, 0.35); border-radius: 14px; background: #02070a; box-shadow: 0 20px 55px rgba(0,0,0,.42), inset 0 0 30px rgba(67,213,223,.04); touch-action: none; }
+.composition-canvas.is-landscape { width: 100%; aspect-ratio: 16 / 9; }
+.composition-layer { position: absolute; display: block; max-width: none; overflow: hidden; border: 1px solid transparent; background: #000; cursor: move; user-select: none; }
+.composition-layer.selected { border-color: #43d5df; box-shadow: inset 0 0 0 1px rgba(255,255,255,.65), 0 0 16px rgba(67,213,223,.4); }
+.composition-resize-handle { position: absolute; z-index: 9; width: 18px; height: 18px; padding: 0; transform: translate(-50%,-50%); border: 2px solid #061015; border-radius: 50%; background: #43d5df; box-shadow: 0 0 12px rgba(67,213,223,.8); cursor: nwse-resize; touch-action: none; }
+.composition-canvas-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 20px; color: var(--text-muted); font-size: 12px; text-align: center; }
+.composition-layer-tabs { display: flex; justify-content: center; gap: 7px; flex-wrap: wrap; }
+.composition-media-hint { color: var(--text-muted); text-align: center; line-height: 1.5; }
+.clip-composer-controls { display: flex; flex-direction: column; min-width: 0; }
+.composition-control-section { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: rgba(4,16,22,.66); }
+.composition-section-title { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 11px; font-size: 12px; }
+.composition-section-title span { color: var(--accent-cyan); }
+.composition-range-track { display: grid; gap: 4px; }
+.composition-range-track input { width: 100%; accent-color: var(--accent-cyan); }
+.composition-time-inputs, .composition-number-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 9px; margin-top: 10px; }
+.composition-number-grid { grid-template-columns: repeat(4, minmax(0,1fr)); }
+.composition-time-inputs label, .composition-number-grid label { display: flex; flex-direction: column; gap: 4px; color: var(--text-muted); font-size: 10px; font-weight: 700; }
+.composition-time-inputs .input, .composition-number-grid .input { min-width: 0; padding: 7px 8px; font-size: 12px; }
+.composition-time-summary { margin-top: 8px; color: var(--accent-gold-bright); font: 700 11px/1.2 ui-monospace, monospace; text-align: center; }
+.composition-inline-control { display: grid; grid-template-columns: 125px minmax(0,1fr); align-items: center; gap: 10px; margin-top: 11px; color: var(--text-secondary); font-size: 12px; }
+.composition-inline-control .input { padding: 7px 9px; font-size: 12px; }
+
+@media (max-width: 860px) { .clip-composer-grid { grid-template-columns: 1fr; } .composition-canvas { max-height: 55vh; } }
+@media (max-width: 760px) { .segment-editor-times { grid-template-columns: 1fr; } .segment-editor-footer { align-items: stretch; flex-direction: column; } .composition-number-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } .clip-composer-modal { width: calc(100vw - 12px); padding: 16px; } }
 
 .workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; margin-bottom: 28px; }
 @media (max-width: 980px) { .workspace-grid { grid-template-columns: minmax(0, 1fr); } }

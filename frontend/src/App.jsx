@@ -1172,7 +1172,9 @@ export default function App({ recentProjectsOverride = null } = {}) {
         <SegmentEditor
           segment={segments[editingIdx]}
           index={editingIdx}
-          duration={video?.metadata?.duration || 0}
+          duration={video?.metadata?.duration || video?.duration || 0}
+          sourceUrl={videoUrl}
+          outputAspectRatio={aspectRatio}
           transcript={transcript}
           onSave={handleSaveSegment}
           onCancel={() => setEditingIdx(null)}
