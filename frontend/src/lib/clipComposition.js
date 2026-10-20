@@ -130,4 +130,22 @@ export function updateCompositionLayer(composition, layerName, patch) {
   return next;
 }
 
+export function serializeExportSegment(segment, sourceIndex = null) {
+  const serialized = {
+    start: Number(segment.start),
+    end: Number(segment.end),
+    label: typeof segment.label === 'string' ? segment.label : '',
+  };
+  if (typeof segment.transcript_text === 'string') {
+    serialized.transcript_text = segment.transcript_text;
+  }
+  if (segment.composition && typeof segment.composition === 'object') {
+    serialized.composition = clone(segment.composition);
+  }
+  if (Number.isInteger(sourceIndex) && sourceIndex >= 0) {
+    serialized.segment_index = sourceIndex;
+  }
+  return serialized;
+}
+
 export { MIN_CLIP_DURATION, MIN_RECT_SIZE };

@@ -139,6 +139,44 @@ class CompositionCommandTests(unittest.TestCase):
         self.assertNotIn("1:a", " ".join(command))
         self.assertNotIn("2:a", " ".join(command))
 
+    def test_concatenated_export_renders_each_segment_with_its_own_composition(self):
+        processor = VideoProcessor()
+        first = composition()
+        second = composition()
+        second["source_start"] = 20.0
+        second["source_end"] = 27.0
+        second["main_layer"]["destination"] = {"x": 0, "y": 0, "width": 1, "height": 0.5}
+        calls = []
+
+        def render(_source, start, end, output, **kwargs):
+            calls.append((start, end, kwargs["composition"]))
+            Path(output).write_bytes(b"clip")
+            return output
+
+        with tempfile.TemporaryDirectory(dir=BACKEND_DIR.parent / "temp") as temp_root:
+            output = Path(temp_root) / "reel.mp4"
+
+            def concat(command):
+                output.write_bytes(b"concat")
+                return SimpleNamespace(stdout="", stderr="")
+
+            with (
+                patch.object(processor, "clip_video", side_effect=render),
+                patch.object(processor, "_run", side_effect=concat),
+            ):
+                processor.export_concatenated(
+                    "source.mp4",
+                    [
+                        {"start": 0, "end": 10, "composition": first},
+                        {"start": 20, "end": 27, "composition": second},
+                    ],
+                    str(output),
+                    padding=0,
+                )
+
+        self.assertEqual([call[2] for call in calls], [first, second])
+        self.assertNotEqual(calls[0][2]["main_layer"], calls[1][2]["main_layer"])
+
 
 if __name__ == "__main__":
     unittest.main()

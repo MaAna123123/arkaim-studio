@@ -1281,21 +1281,20 @@ async def _export_segments(
     span_pct: int = 90,
 ) -> list[dict]:
     """Общая нарезка клипов — используется и ручным экспортом, и авто-конвейером."""
-    ad_path = None
-    if insert_ad:
-        for ext in [".mp4", ".mkv", ".mov", ".webm"]:
-            candidate = ADS_DIR / f"current_ad{ext}"
-            if candidate.exists():
-                ad_path = str(candidate)
-                break
-
-    banner_path = None
-    if video_banner_enabled:
-        for ext in [".mp4", ".mkv", ".mov", ".webm", ".avi"]:
-            candidate = BANNER_DIR / f"current_banner{ext}"
-            if candidate.exists():
-                banner_path = str(candidate)
-                break
+    composition_needs_ad = any(
+        (segment.get("composition") or {}).get("ad_layer", {}).get("enabled", True)
+        for segment in segments
+        if (segment.get("composition") or {}).get("ad_layer")
+    )
+    composition_needs_banner = any(
+        (segment.get("composition") or {}).get("banner_layer", {}).get("enabled", True)
+        for segment in segments
+        if (segment.get("composition") or {}).get("banner_layer")
+    )
+    current_ad = _current_uploaded_video(ADS_DIR, "current_ad") if insert_ad or composition_needs_ad else None
+    current_banner = _current_uploaded_video(BANNER_DIR, "current_banner") if video_banner_enabled or composition_needs_banner else None
+    ad_path = str(current_ad) if current_ad else None
+    banner_path = str(current_banner) if current_banner else None
 
     results: list[dict] = []
     export_id = uuid.uuid4().hex[:8]
@@ -1308,17 +1307,9 @@ async def _export_segments(
             video_path, segments, out_path, padding, aspect_ratio, burn_subtitles, words,
             text_ad_enabled, text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity,
             video_banner_enabled, banner_path or "", video_banner_height,
+            overlay_ad_path=ad_path or "",
+            insert_ad_path=ad_path if insert_ad else "",
         )
-        if ad_path and os.path.exists(out_path):
-            ad_out = out_path.replace(".mp4", "_ad.mp4")
-            try:
-                await broadcast({"type": "progress", "step": "exporting",
-                                 "pct": base_pct + span_pct - 2, "msg": "📺 Вставляю рекламный ролик..."})
-                await asyncio.to_thread(processor.insert_ad_into_clip, out_path, ad_path, ad_out)
-                os.replace(ad_out, out_path)
-            except Exception as ad_err:
-                logger.warning(f"Не удалось вставить рекламу в склеенный ролик: {ad_err}")
-
         await broadcast({"type": "progress", "step": "exporting",
                          "pct": base_pct + span_pct, "msg": "Готово!"})
         return [{"url": f"/clips/{out_name}", "label": f"Highlights Reel ({aspect_ratio})"}]
@@ -1341,13 +1332,22 @@ async def _export_segments(
                     padding, aspect_ratio, "", burn_subtitles, words,
                     text_ad_enabled, text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity,
                     video_banner_enabled, banner_path or "", video_banner_height,
+                    composition=seg.get("composition"),
+                    overlay_ad_path=ad_path or "",
                 )
         except Exception as exc:
-            # Один сбойный клип не должен ронять весь экспорт
             logger.warning(f"Клип {i + 1} не удалось нарезать: {exc}")
             return i, None
 
-        if ad_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        composition = seg.get("composition")
+        ad_layer = composition.get("ad_layer") if composition else None
+        should_insert_ad = bool(
+            ad_path and (
+                (composition is None and insert_ad)
+                or (ad_layer and ad_layer.get("enabled", True) and ad_layer.get("mode") == "insert")
+            )
+        )
+        if should_insert_ad and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
             ad_out = out_path.replace(".mp4", "_ad.mp4")
             try:
                 await broadcast({"type": "progress", "step": "exporting",
@@ -1374,6 +1374,7 @@ async def _export_segments(
             "start": seg.get("start", 0),
             "end": seg.get("end", 0),
             "transcript_text": seg.get("transcript_text", ""),
+            "segment_index": seg.get("segment_index", i),
         }
 
     exported = await asyncio.gather(*(export_one(i, seg) for i, seg in enumerate(segments)))
@@ -1383,7 +1384,6 @@ async def _export_segments(
         raise HTTPException(status_code=500, detail="Ни один клип не удалось нарезать. Проверьте, что FFmpeg установлен.")
 
     return results
-
 
 @app.post("/api/video/export")
 async def export_clips(req: ExportRequest):

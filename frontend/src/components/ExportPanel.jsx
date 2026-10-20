@@ -111,6 +111,7 @@ export default function ExportPanel({
   apiBase,
   onDownloadClip,
   transcript,
+  onReEdit,
 }) {
   const [previewClip, setPreviewClip] = useState(null);
   const previewVideoRef = useRef(null);
@@ -465,6 +466,16 @@ function findClipStart(previewClip, transcript) {
                 <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{apiBase}{clip.url}</div>
               </div>
               <div className="clip-result-actions">
+                {Number.isInteger(clip.segment_index) && (
+                  <button
+                    id={`btn-reedit-clip-${index}`}
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => onReEdit?.(clip.segment_index)}
+                  >
+                    ✏️ Редактировать снова
+                  </button>
+                )}
                 <button
                   id={`btn-preview-clip-${index}`}
                   type="button"

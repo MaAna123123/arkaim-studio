@@ -5,6 +5,7 @@ import {
   compositionDuration,
   createDefaultComposition,
   normalizeComposition,
+  serializeExportSegment,
   updateCompositionLayer,
 } from './clipComposition.js';
 
@@ -63,4 +64,23 @@ test('updates one layer without mutating the previous composition', () => {
   assert.equal(base.main_layer.destination.height, 1);
   assert.equal(updated.main_layer.destination.height, 0.75);
   assert.equal(compositionDuration(updated), 10);
+});
+
+test('serializes each export segment with an independent composition and source index', () => {
+  const first = createDefaultComposition({ start: 1, end: 5 }, '9:16');
+  const serialized = serializeExportSegment({
+    start: 1,
+    end: 5,
+    label: 'Moment',
+    transcript_text: 'spoken words',
+    composition: first,
+    source_path: 'must-not-leak.mp4',
+  }, 7);
+
+  assert.equal(serialized.segment_index, 7);
+  assert.equal(serialized.composition.source_start, 1);
+  assert.equal(serialized.transcript_text, 'spoken words');
+  assert.equal('source_path' in serialized, false);
+  serialized.composition.main_layer.crop.x = 0.4;
+  assert.equal(first.main_layer.crop.x, 0);
 });

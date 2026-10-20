@@ -658,6 +658,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_banner_enabled: bool = False,
         video_banner_path: str = "",
         video_banner_height: int = 380,
+        overlay_ad_path: str = "",
+        insert_ad_path: str = "",
     ) -> str:
         """Clip each segment to a temp file, then concatenate all into one final video."""
         if not segments:
@@ -690,7 +692,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     video_banner_enabled=video_banner_enabled,
                     video_banner_path=video_banner_path,
                     video_banner_height=video_banner_height,
+                    composition=seg.get("composition"),
+                    overlay_ad_path=overlay_ad_path,
                 )
+                composition = seg.get("composition")
+                ad_layer = composition.get("ad_layer") if composition else None
+                insert_path = (
+                    overlay_ad_path
+                    if ad_layer and ad_layer.get("enabled", True) and ad_layer.get("mode") == "insert"
+                    else (insert_ad_path if composition is None else "")
+                )
+                if insert_path:
+                    inserted_path = os.path.join(tmp_dir, f"clip_{i:04d}_ad.mp4")
+                    self.insert_ad_into_clip(clip_path, insert_path, inserted_path)
+                    os.replace(inserted_path, clip_path)
                 clip_paths.append(clip_path)
 
             with open(concat_list, "w", encoding="utf-8") as f:

@@ -17,6 +17,7 @@ import OperationPanel from './components/OperationPanel';
 import RecentProjects from './components/RecentProjects';
 import useOperation, { isUnfinishedTranscription } from './hooks/useOperation';
 import { mapProjectToEditorState } from './lib/projectState';
+import { serializeExportSegment } from './lib/clipComposition';
 import {
   canUseRecentProjects,
   createProjectLifecycleController,
@@ -731,7 +732,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             video_id: video.video_id,
-            segments: segs.map((segment) => ({ start: segment.start, end: segment.end, label: segment.label })),
+            segments: segs.map((segment, index) => serializeExportSegment(segment, index)),
             mode: 'separate',
             padding: exportPadding,
             aspect_ratio: aspectRatio,
@@ -811,7 +812,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           video_id: video.video_id,
-          segments: [{ start: seg.start, end: seg.end, label: seg.label }],
+          segments: [serializeExportSegment(seg, index)],
           mode: 'separate',
           padding,
           aspect_ratio: aspectRatio,
@@ -848,8 +849,9 @@ export default function App({ recentProjectsOverride = null } = {}) {
     setProgress({ pct: 0, msg: 'Нарезка клипов...' });
 
     const segsToExport = segments
-      .filter((_, i) => selected.has(i))
-      .map((s) => ({ start: s.start, end: s.end, label: s.label }));
+      .map((segment, index) => ({ segment, index }))
+      .filter(({ index }) => selected.has(index))
+      .map(({ segment, index }) => serializeExportSegment(segment, index));
 
     try {
       const r = await fetch(`${API}/api/video/export`, {
@@ -1132,6 +1134,9 @@ export default function App({ recentProjectsOverride = null } = {}) {
               apiBase={API}
               onDownloadClip={downloadClipFile}
               transcript={transcript}
+              onReEdit={(index) => {
+                if (Number.isInteger(index) && segments[index]) setEditingIdx(index);
+              }}
             />
           </section>
         )}
