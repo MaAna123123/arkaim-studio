@@ -1391,11 +1391,12 @@ async def export_clips(req: ExportRequest):
         raise HTTPException(status_code=404, detail="Video not found")
     if not req.segments:
         raise HTTPException(status_code=400, detail="Не выбраны фрагменты для экспорта")
+    segments = [segment.model_dump(exclude_none=True) for segment in req.segments]
     if req.mode not in {"separate", "concat"}:
         raise HTTPException(status_code=400, detail="Неизвестный режим экспорта")
     if req.aspect_ratio not in {"original", "9:16"}:
         raise HTTPException(status_code=400, detail="Неизвестный формат кадра")
-    for segment in req.segments:
+    for segment in segments:
         try:
             if float(segment["start"]) < 0 or float(segment["end"]) <= float(segment["start"]):
                 raise ValueError
@@ -1417,7 +1418,7 @@ async def export_clips(req: ExportRequest):
     results = await _export_segments(
         video_id=req.video_id,
         video_path=str(video_path),
-        segments=req.segments,
+        segments=segments,
         mode=req.mode,
         padding=req.padding,
         aspect_ratio=req.aspect_ratio,
