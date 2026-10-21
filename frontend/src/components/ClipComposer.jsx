@@ -102,6 +102,10 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
 
   const save = () => onSave?.(index, { ...segment, start: composition.source_start, end: composition.source_end, label, transcript_text: selectedText, composition });
   const reset = () => { setComposition(createDefaultComposition(segment, outputAspectRatio)); setSelectedLayer('main_layer'); };
+  const resetToLegacy = () => {
+    const { composition: _discardedComposition, ...legacySegment } = segment;
+    onSave?.(index, legacySegment);
+  };
 
   return (
     <div className="modal-overlay composition-modal-overlay" onMouseDown={(event) => event.target === event.currentTarget && onCancel?.()}>
@@ -135,7 +139,7 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
           </div>
         </div>
         {contextWords.length > 0 && <div className="segment-editor-text-block"><div className="segment-editor-text-head"><strong>Точный выбор по словам</strong><small>Выделите мышкой фразу — границы клипа обновятся</small></div><div ref={wordsRef} className="segment-editor-words" onMouseUp={captureTranscriptRange}>{contextWords.map((word, wordIndex) => <span key={`${word.start}-${wordIndex}`} data-composer-word={wordIndex} className={word.end >= composition.source_start && word.start <= composition.source_end ? 'included' : ''}>{word.word}{' '}</span>)}</div></div>}
-        <div className="segment-editor-footer"><button type="button" className="btn btn-ghost" onClick={reset}>Сбросить компоновку</button><div><button type="button" className="btn btn-secondary" onClick={onCancel}>Отмена</button><button id="btn-save-composition" type="button" className="btn btn-primary" onClick={save}>✓ Сохранить клип</button></div></div>
+        <div className="segment-editor-footer"><div><button type="button" className="btn btn-ghost" onClick={reset}>Сбросить поля</button><button id="btn-reset-legacy-composition" type="button" className="btn btn-ghost" onClick={resetToLegacy}>Обычный экспорт без компоновки</button></div><div><button type="button" className="btn btn-secondary" onClick={onCancel}>Отмена</button><button id="btn-save-composition" type="button" className="btn btn-primary" onClick={save}>✓ Сохранить клип</button></div></div>
       </div>
     </div>
   );

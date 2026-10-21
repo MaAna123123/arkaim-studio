@@ -71,3 +71,21 @@ test('numeric geometry fields resize width and height independently', async () =
   assert.equal(saved.composition.main_layer.destination.width, 0.8);
   assert.equal(saved.composition.main_layer.destination.height, 0.6);
 });
+
+test('can remove a saved composition and return the clip to legacy export', async () => {
+  const segment = { start: 2, end: 8, composition: { source_start: 2, source_end: 8 } };
+  let saved;
+  let renderer;
+  await act(async () => {
+    renderer = TestRenderer.create(React.createElement(ClipComposer, {
+      segment, index: 0, sourceDuration: 20,
+      onSave: (_index, value) => { saved = value; }, onCancel: () => {},
+    }));
+  });
+
+  await act(async () => byId(renderer.root, 'btn-reset-legacy-composition').props.onClick());
+
+  assert.equal('composition' in saved, false);
+  assert.equal(saved.start, 2);
+  assert.equal(saved.end, 8);
+});
