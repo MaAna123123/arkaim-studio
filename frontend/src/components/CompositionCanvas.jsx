@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { updateCompositionLayer } from '../lib/clipComposition.js';
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -14,15 +14,23 @@ function mediaStyle(rect, fit) {
   };
 }
 
-function croppedSourceStyle(crop, fit) {
+function croppedSourceStyle(crop, fit, sourceAspect, canvasAspect, destination) {
+  const destinationAspect = canvasAspect * destination.width / destination.height;
+  const cropAspect = sourceAspect * crop.width / crop.height;
+  const cover = fit === 'cover';
+  const useFullWidth = cover ? cropAspect <= destinationAspect : cropAspect >= destinationAspect;
+  const renderedWidth = useFullWidth ? 100 : (cropAspect / destinationAspect) * 100;
+  const renderedHeight = useFullWidth ? (destinationAspect / cropAspect) * 100 : 100;
+  const renderedLeft = (100 - renderedWidth) / 2;
+  const renderedTop = (100 - renderedHeight) / 2;
   return {
     position: 'absolute',
-    left: `${-(crop.x / crop.width) * 100}%`,
-    top: `${-(crop.y / crop.height) * 100}%`,
-    width: `${100 / crop.width}%`,
-    height: `${100 / crop.height}%`,
+    left: `${renderedLeft - (crop.x / crop.width) * renderedWidth}%`,
+    top: `${renderedTop - (crop.y / crop.height) * renderedHeight}%`,
+    width: `${renderedWidth / crop.width}%`,
+    height: `${renderedHeight / crop.height}%`,
     maxWidth: 'none',
-    objectFit: fit,
+    objectFit: 'fill',
   };
 }
 
@@ -33,6 +41,8 @@ export default function CompositionCanvas({
   selectedLayer,
   bannerMedia,
   adMedia,
+  sourceWidth = 0,
+  sourceHeight = 0,
   onCompositionChange,
 }) {
   const canvasRef = useRef(null);
@@ -40,6 +50,11 @@ export default function CompositionCanvas({
   const bannerRef = useRef(null);
   const adRef = useRef(null);
   const dragRef = useRef(null);
+  const [intrinsicSize, setIntrinsicSize] = useState({ width: 0, height: 0 });
+  const effectiveSourceWidth = Number(sourceWidth) || intrinsicSize.width || 16;
+  const effectiveSourceHeight = Number(sourceHeight) || intrinsicSize.height || 9;
+  const sourceAspect = effectiveSourceWidth / effectiveSourceHeight;
+  const canvasAspect = composition.output_aspect_ratio === 'original' ? sourceAspect : 9 / 16;
 
   const layer = useMemo(() => {
     if (selectedLayer === 'main_layer') return composition.main_layer;
@@ -91,6 +106,7 @@ export default function CompositionCanvas({
     <div
       ref={canvasRef}
       className={`composition-canvas ${composition.output_aspect_ratio === 'original' ? 'is-landscape' : ''}`}
+      style={{ aspectRatio: composition.output_aspect_ratio === 'original' ? `${effectiveSourceWidth} / ${effectiveSourceHeight}` : '9 / 16' }}
       onPointerMove={moveDrag}
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
@@ -107,7 +123,8 @@ export default function CompositionCanvas({
             muted
             playsInline
             preload="metadata"
-            style={croppedSourceStyle(composition.main_layer.crop, composition.main_layer.fit)}
+            onLoadedMetadata={(event) => setIntrinsicSize({ width: event.currentTarget.videoWidth, height: event.currentTarget.videoHeight })}
+            style={croppedSourceStyle(composition.main_layer.crop, composition.main_layer.fit, sourceAspect, canvasAspect, composition.main_layer.destination)}
           />
         </div>
       )}

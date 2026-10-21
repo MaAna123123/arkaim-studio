@@ -4,7 +4,7 @@ import math
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 
 class NormalizedRect(BaseModel):
@@ -19,11 +19,11 @@ class NormalizedRect(BaseModel):
     def validate_bounds(self):
         values = (self.x, self.y, self.width, self.height)
         if not all(math.isfinite(value) for value in values):
-            raise ValueError("Crop coordinates must be finite")
+            raise ValueError("Координаты области должны быть конечными числами")
         if self.x < 0 or self.y < 0 or self.width < 0.03 or self.height < 0.03:
-            raise ValueError("Crop region is outside the frame or too small")
+            raise ValueError("Область выходит за границы кадра или слишком мала")
         if self.x + self.width > 1 or self.y + self.height > 1:
-            raise ValueError("Crop region must stay inside the frame")
+            raise ValueError("Область должна целиком находиться внутри кадра")
         return self
 
 
@@ -38,6 +38,13 @@ class MainVideoLayer(BaseModel):
     destination: NormalizedRect
     fit: Literal["contain", "cover"] = "cover"
 
+    @field_validator("fit", mode="before")
+    @classmethod
+    def validate_fit(cls, value):
+        if value not in {"contain", "cover"}:
+            raise ValueError("Режим вписывания основного видео не поддерживается")
+        return value
+
 
 class TimedOverlayLayer(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -47,18 +54,33 @@ class TimedOverlayLayer(BaseModel):
     fit: Literal["contain", "cover", "stretch"] = "cover"
     start: float = 0.0
     end: float
+    asset_revision: str | None = None
+
+    @field_validator("fit", mode="before")
+    @classmethod
+    def validate_fit(cls, value):
+        if value not in {"contain", "cover", "stretch"}:
+            raise ValueError("Режим вписывания видеослоя не поддерживается")
+        return value
 
     @model_validator(mode="after")
     def validate_times(self):
         if not math.isfinite(self.start) or not math.isfinite(self.end):
-            raise ValueError("Overlay times must be finite")
+            raise ValueError("Время показа видеослоя должно быть конечным числом")
         if self.start < 0 or self.end <= self.start:
-            raise ValueError("Overlay time range is invalid")
+            raise ValueError("Некорректный интервал показа видеослоя")
         return self
 
 
 class AdLayer(TimedOverlayLayer):
     mode: Literal["insert", "overlay"] = "overlay"
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def validate_mode(cls, value):
+        if value not in {"insert", "overlay"}:
+            raise ValueError("Режим рекламы должен быть insert или overlay")
+        return value
 
 
 class ClipComposition(BaseModel):
@@ -71,16 +93,23 @@ class ClipComposition(BaseModel):
     banner_layer: TimedOverlayLayer | None = None
     ad_layer: AdLayer | None = None
 
+    @field_validator("output_aspect_ratio", mode="before")
+    @classmethod
+    def validate_output_aspect_ratio(cls, value):
+        if value not in {"original", "9:16"}:
+            raise ValueError("Формат композиции должен быть original или 9:16")
+        return value
+
     @model_validator(mode="after")
     def validate_timeline(self):
         if not math.isfinite(self.source_start) or not math.isfinite(self.source_end):
-            raise ValueError("Source times must be finite")
+            raise ValueError("Границы исходного видео должны быть конечными числами")
         duration = self.source_end - self.source_start
         if self.source_start < 0 or duration < 0.5:
-            raise ValueError("Source time range is invalid")
+            raise ValueError("Некорректные границы исходного видео")
         for layer in (self.banner_layer, self.ad_layer):
             if layer is not None and layer.end > duration:
-                raise ValueError("Overlay exceeds the edited clip duration")
+                raise ValueError("Видеослой выходит за длительность клипа")
         return self
 
 
@@ -95,14 +124,14 @@ class ExportSegment(BaseModel):
     @model_validator(mode="after")
     def validate_segment_times(self):
         if not math.isfinite(self.start) or not math.isfinite(self.end):
-            raise ValueError("Segment times must be finite")
+            raise ValueError("Таймкоды фрагмента должны быть конечными числами")
         if self.start < 0 or self.end <= self.start:
-            raise ValueError("Segment time range is invalid")
+            raise ValueError("Некорректные таймкоды фрагмента")
         if self.composition is not None and (
             abs(self.start - self.composition.source_start) > 0.001
             or abs(self.end - self.composition.source_end) > 0.001
         ):
-            raise ValueError("Segment times must match composition source times")
+            raise ValueError("Таймкоды фрагмента не совпадают с границами композиции")
         return self
 
 

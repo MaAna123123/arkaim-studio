@@ -1179,6 +1179,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
           index={editingIdx}
           duration={video?.metadata?.duration || video?.duration || 0}
           sourceUrl={videoUrl}
+          sourceWidth={video?.metadata?.width || video?.width || 0}
+          sourceHeight={video?.metadata?.height || video?.height || 0}
           outputAspectRatio={aspectRatio}
           bannerMedia={bannerMedia}
           adMedia={adMedia}

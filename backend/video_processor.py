@@ -426,8 +426,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
 
         composition_vertical = bool(composition and composition.get("output_aspect_ratio") == "9:16")
-        output_width = 1080 if composition_vertical else (720 if aspect_ratio == "9:16" else int(meta.get("width") or 1280))
-        output_height = 1920 if composition_vertical else (1280 if aspect_ratio == "9:16" else int(meta.get("height") or 720))
+        source_width = max(2, int(meta.get("width") or 1280) // 2 * 2)
+        source_height = max(2, int(meta.get("height") or 720) // 2 * 2)
+        output_width = 1080 if composition_vertical else (source_width if composition else (720 if aspect_ratio == "9:16" else source_width))
+        output_height = 1920 if composition_vertical else (source_height if composition else (1280 if aspect_ratio == "9:16" else source_height))
 
         if burn_subtitles and words:
             try:
@@ -668,7 +670,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         temp_root = Path(__file__).parent.parent.resolve() / "temp"
         temp_root.mkdir(parents=True, exist_ok=True)
         tmp_dir = tempfile.mkdtemp(dir=str(temp_root))
-        concat_list = os.path.join(tmp_dir, "concat.txt")
         clip_paths = []
 
         try:
@@ -708,19 +709,53 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     os.replace(inserted_path, clip_path)
                 clip_paths.append(clip_path)
 
-            with open(concat_list, "w", encoding="utf-8") as f:
-                for cp in clip_paths:
-                    escaped_path = Path(cp).as_posix().replace("'", "'\\''")
-                    f.write(f"file '{escaped_path}'\n")
+            first_composition = segments[0].get("composition") or {}
+            target_ratio = first_composition.get("output_aspect_ratio", aspect_ratio)
+            source_meta = self.extract_metadata(video_path)
+            if target_ratio == "9:16":
+                target_width, target_height = 1080, 1920
+            else:
+                target_width = max(2, int(source_meta.get("width") or 1280) // 2 * 2)
+                target_height = max(2, int(source_meta.get("height") or 720) // 2 * 2)
 
-            cmd = [
-                "ffmpeg",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list,
-                "-c", "copy",
+            cmd = ["ffmpeg"]
+            for clip_path in clip_paths:
+                cmd.extend(["-i", clip_path])
+
+            filters = []
+            concat_inputs = []
+            for i, clip_path in enumerate(clip_paths):
+                clip_meta = self.extract_metadata(clip_path)
+                clip_duration = max(0.001, float(clip_meta.get("duration") or 0.001))
+                filters.append(
+                    f"[{i}:v]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease:flags=lanczos,"
+                    f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:black,"
+                    "fps=30,setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+                    f"[v{i}]"
+                )
+                if self._has_audio(clip_path):
+                    filters.append(
+                        f"[{i}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                        f"asetpts=PTS-STARTPTS[a{i}]"
+                    )
+                else:
+                    filters.append(
+                        f"anullsrc=channel_layout=stereo:sample_rate=44100,"
+                        f"atrim=duration={clip_duration:.6f},asetpts=PTS-STARTPTS[a{i}]"
+                    )
+                concat_inputs.append(f"[v{i}][a{i}]")
+            filters.append(
+                "".join(concat_inputs)
+                + f"concat=n={len(clip_paths)}:v=1:a=1[outv][outa]"
+            )
+            cmd.extend([
+                "-filter_complex", ";".join(filters),
+                "-map", "[outv]", "-map", "[outa]",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
+                "-movflags", "+faststart",
                 "-y", out_path,
-            ]
+            ])
             self._run(cmd)
             if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
                 raise RuntimeError("FFmpeg не создал итоговый ролик")

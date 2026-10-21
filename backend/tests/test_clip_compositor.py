@@ -93,6 +93,37 @@ class ClipCompositorFilterTests(unittest.TestCase):
 
 
 class CompositionCommandTests(unittest.TestCase):
+    def test_original_composition_ignores_global_vertical_format_and_uses_even_canvas(self):
+        processor = VideoProcessor()
+        value = composition()
+        value["output_aspect_ratio"] = "original"
+        commands = []
+        with tempfile.TemporaryDirectory(dir=BACKEND_DIR.parent / "temp") as temp_root:
+            root = Path(temp_root)
+            source = root / "source.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"media")
+
+            def record(command):
+                commands.append(command)
+                output.write_bytes(b"rendered")
+                return SimpleNamespace(stdout="", stderr="")
+
+            with (
+                patch.object(processor, "extract_metadata", return_value={
+                    "duration": 12.0, "width": 1919, "height": 1079, "fps": 30,
+                }),
+                patch.object(processor, "_run", side_effect=record),
+            ):
+                processor.clip_video(
+                    str(source), 0, 10, str(output), aspect_ratio="9:16",
+                    composition=value, burn_subtitles=False,
+                )
+
+        filter_graph = commands[0][commands[0].index("-filter_complex") + 1]
+        self.assertIn("color=c=black:s=1918x1078", filter_graph)
+        self.assertNotIn("720x1280", filter_graph)
+
     def test_composed_clip_loops_visual_inputs_and_keeps_only_source_audio(self):
         processor = VideoProcessor()
         value = composition()
@@ -155,13 +186,19 @@ class CompositionCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir=BACKEND_DIR.parent / "temp") as temp_root:
             output = Path(temp_root) / "reel.mp4"
+            concat_commands = []
 
             def concat(command):
+                concat_commands.append(command)
                 output.write_bytes(b"concat")
                 return SimpleNamespace(stdout="", stderr="")
 
             with (
                 patch.object(processor, "clip_video", side_effect=render),
+                patch.object(processor, "extract_metadata", return_value={
+                    "duration": 10.0, "width": 1920, "height": 1080, "fps": 30,
+                }),
+                patch.object(processor, "_has_audio", return_value=True),
                 patch.object(processor, "_run", side_effect=concat),
             ):
                 processor.export_concatenated(
@@ -176,6 +213,9 @@ class CompositionCommandTests(unittest.TestCase):
 
         self.assertEqual([call[2] for call in calls], [first, second])
         self.assertNotEqual(calls[0][2]["main_layer"], calls[1][2]["main_layer"])
+        command = concat_commands[0]
+        self.assertIn("concat=n=2:v=1:a=1[outv][outa]", command)
+        self.assertNotIn("copy", command)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Optional
 
 import aiofiles
-from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -80,6 +82,18 @@ os.environ["HF_HOME"] = str(MODELS_DIR)
 
 # App setup
 app = FastAPI(title="videopril API", version="2.0.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def composition_validation_error(_request: Request, exc: RequestValidationError):
+    composition_errors = [
+        error for error in exc.errors()
+        if "composition" in tuple(str(item) for item in error.get("loc", ()))
+    ]
+    if composition_errors:
+        message = str(composition_errors[0].get("ctx", {}).get("error") or "Некорректные настройки композиции")
+        return JSONResponse(status_code=422, content={"detail": f"Некорректная композиция: {message}"})
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": exc.errors()}))
 
 app.add_middleware(
     CORSMiddleware,
@@ -1400,6 +1414,16 @@ async def export_clips(req: ExportRequest):
     source_meta = await asyncio.to_thread(processor.extract_metadata, str(video_path))
     source_duration = float(source_meta.get("duration") or 0)
     segments = [validate_composition_for_source(segment, source_duration) for segment in segments]
+    if req.mode == "concat":
+        effective_ratios = {
+            (segment.get("composition") or {}).get("output_aspect_ratio", req.aspect_ratio)
+            for segment in segments
+        }
+        if len(effective_ratios) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="Для склейки все клипы должны иметь один формат кадра",
+            )
     for segment in segments:
         try:
             start = float(segment["start"])
@@ -1450,6 +1474,21 @@ def _current_uploaded_video(directory: Path, prefix: str) -> Path | None:
     return None
 
 
+def _media_revision(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size:x}-{stat.st_mtime_ns:x}"
+
+
+def _validate_layer_asset(layer: dict | None, path: Path | None, label: str) -> None:
+    if not layer or not layer.get("enabled", True):
+        return
+    if path is None:
+        raise ValueError(f"{label} не найден — загрузите его заново")
+    expected = str(layer.get("asset_revision") or "")
+    if not expected or expected != _media_revision(path):
+        raise ValueError(f"{label} был заменён — откройте клип и выберите его заново")
+
+
 def validate_composition_for_source(segment: dict, source_duration: float) -> dict:
     """Validate source-dependent composition rules before creating output files."""
     composition = segment.get("composition")
@@ -1460,16 +1499,24 @@ def validate_composition_for_source(segment: dict, source_duration: float) -> di
         end = float(composition["source_end"])
         if not math.isfinite(source_duration) or source_duration <= 0:
             raise ValueError("Не удалось определить длительность исходного видео")
-        if start < 0 or end <= start or end > source_duration + 0.001:
+        if abs(end - source_duration) <= 0.001:
+            end = source_duration
+            composition["source_end"] = end
+            segment["end"] = end
+        if start < 0 or end <= start or end > source_duration:
             raise ValueError("Границы клипа выходят за пределы исходного видео")
         if abs(float(segment["start"]) - start) > 0.001 or abs(float(segment["end"]) - end) > 0.001:
             raise ValueError("Границы клипа не совпадают с настройками композиции")
-        banner = composition.get("banner_layer")
-        if banner and banner.get("enabled", True) and _current_uploaded_video(BANNER_DIR, "current_banner") is None:
-            raise ValueError("Видео-баннер не найден — загрузите его заново")
-        ad = composition.get("ad_layer")
-        if ad and ad.get("enabled", True) and _current_uploaded_video(ADS_DIR, "current_ad") is None:
-            raise ValueError("Видео-реклама не найдена — загрузите её заново")
+        _validate_layer_asset(
+            composition.get("banner_layer"),
+            _current_uploaded_video(BANNER_DIR, "current_banner"),
+            "Видео-баннер",
+        )
+        _validate_layer_asset(
+            composition.get("ad_layer"),
+            _current_uploaded_video(ADS_DIR, "current_ad"),
+            "Видео-реклама",
+        )
     except (KeyError, TypeError, ValueError) as exc:
         detail = str(exc) or "Некорректные настройки композиции клипа"
         raise HTTPException(status_code=422, detail=detail) from exc
@@ -1505,6 +1552,7 @@ async def upload_ad(file: UploadFile = File(...)):
             "width": meta.get("width", 0),
             "height": meta.get("height", 0),
             "size_bytes": meta.get("size_bytes", 0),
+            "revision": _media_revision(ad_path),
             "url": f"/ads/{ad_path.name}",
         }
     except Exception as exc:
@@ -1529,10 +1577,16 @@ async def get_current_ad():
                     "width": meta.get("width", 0),
                     "height": meta.get("height", 0),
                     "size_bytes": meta.get("size_bytes", 0),
+                    "revision": _media_revision(ad_path),
                     "url": f"/ads/current_ad{ext}",
                 }
             except Exception:
-                return {"has_ad": True, "filename": f"current_ad{ext}", "url": f"/ads/current_ad{ext}"}
+                return {
+                    "has_ad": True,
+                    "filename": f"current_ad{ext}",
+                    "revision": _media_revision(ad_path),
+                    "url": f"/ads/current_ad{ext}",
+                }
     return {"has_ad": False}
 
 
@@ -1577,6 +1631,7 @@ async def upload_banner(file: UploadFile = File(...)):
             "width": meta.get("width", 0),
             "height": meta.get("height", 0),
             "size_bytes": meta.get("size_bytes", 0),
+            "revision": _media_revision(banner_path),
             "url": f"/banners/{banner_path.name}",
         }
     except Exception as exc:
@@ -1601,10 +1656,16 @@ async def get_current_banner():
                     "width": meta.get("width", 0),
                     "height": meta.get("height", 0),
                     "size_bytes": meta.get("size_bytes", 0),
+                    "revision": _media_revision(bp),
                     "url": f"/banners/current_banner{ext}",
                 }
             except Exception:
-                return {"has_banner": True, "filename": f"current_banner{ext}", "url": f"/banners/current_banner{ext}"}
+                return {
+                    "has_banner": True,
+                    "filename": f"current_banner{ext}",
+                    "revision": _media_revision(bp),
+                    "url": f"/banners/current_banner{ext}",
+                }
     return {"has_banner": False}
 
 

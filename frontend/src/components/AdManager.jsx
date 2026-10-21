@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { toEditorMedia } from '../lib/mediaAsset.js';
 
+const previewUrl = (apiBase, info) => {
+  if (!info?.url) return '';
+  const separator = info.url.includes('?') ? '&' : '?';
+  return `${apiBase}${info.url}${info.revision ? `${separator}v=${encodeURIComponent(info.revision)}` : ''}`;
+};
+
 function AdSection({ apiBase, onAdStatusChange }) {
   const [adInfo, setAdInfo] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -81,7 +87,7 @@ function AdSection({ apiBase, onAdStatusChange }) {
         <div className="ad-manager-loaded">
           <div className="ad-manager-preview">
             <video
-              src={`${apiBase}${adInfo.url}`}
+                src={previewUrl(apiBase, adInfo)}
               className="ad-manager-video"
               muted preload="metadata"
               onMouseEnter={(e) => e.target.play()}
@@ -214,7 +220,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
         <div className="ad-manager-loaded">
           <div className="ad-manager-preview">
             <video
-              src={`${apiBase}${bannerInfo.url}`}
+                src={previewUrl(apiBase, bannerInfo)}
               className="ad-manager-video"
               muted loop preload="metadata"
               onMouseEnter={(e) => e.target.play()}

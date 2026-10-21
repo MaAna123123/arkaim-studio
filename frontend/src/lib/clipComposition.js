@@ -43,6 +43,7 @@ function normalizeOverlay(value, duration, { ad = false } = {}) {
     fit: value.fit,
     start,
     end,
+    asset_revision: typeof value.asset_revision === 'string' ? value.asset_revision : '',
   };
   if (ad) {
     if (!AD_MODES.has(value.mode)) return null;

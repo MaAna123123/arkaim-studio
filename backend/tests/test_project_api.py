@@ -679,6 +679,14 @@ class CompositionExportValidationTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 422)
         self.assertIn("исходного видео", raised.exception.detail)
 
+    def test_source_end_within_metadata_tolerance_is_snapped_to_exact_duration(self):
+        segment = self.segment(0.0, 60.0005)
+
+        main.validate_composition_for_source(segment, 60.0)
+
+        self.assertEqual(segment["end"], 60.0)
+        self.assertEqual(segment["composition"]["source_end"], 60.0)
+
     def test_missing_enabled_banner_and_ad_are_rejected(self):
         for layer_name, layer in (
             ("banner_layer", {"enabled": True}),
@@ -698,6 +706,24 @@ class CompositionExportValidationTests(unittest.TestCase):
         segment = {"start": 1.0, "end": 2.0, "label": "Legacy"}
 
         self.assertIs(main.validate_composition_for_source(segment, 60.0), segment)
+
+    def test_replaced_banner_revision_is_rejected(self):
+        banner = self.banner_dir / "current_banner.mp4"
+        banner.write_bytes(b"new banner")
+        segment = self.segment()
+        segment["composition"]["banner_layer"] = {
+            "enabled": True,
+            "asset_revision": "old-revision",
+        }
+
+        with (
+            patch.object(main, "BANNER_DIR", self.banner_dir),
+            self.assertRaises(main.HTTPException) as raised,
+        ):
+            main.validate_composition_for_source(segment, 60.0)
+
+        self.assertEqual(raised.exception.status_code, 422)
+        self.assertIn("заменён", raised.exception.detail)
 
 
 if __name__ == "__main__":

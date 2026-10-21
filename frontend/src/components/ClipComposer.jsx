@@ -17,6 +17,10 @@ function defaultOverlay(duration, extra = {}) {
   return { enabled: true, destination: { x: 0, y: 0, width: 1, height: 0.25 }, fit: 'contain', start: 0, end: Math.max(0.5, duration), ...extra };
 }
 
+const mediaMatchesLayer = (layer, media) => Boolean(
+  media?.url && media?.revision && layer?.asset_revision === media.revision
+);
+
 function clampOverlay(layer, duration) {
   if (!layer) return null;
   const end = clamp(Number(layer.end) || duration, 0.5, duration);
@@ -24,7 +28,7 @@ function clampOverlay(layer, duration) {
   return { ...layer, start: round(start), end: round(end) };
 }
 
-export default function ClipComposer({ segment, index = 0, sourceDuration = 0, sourceUrl = '', outputAspectRatio = '9:16', bannerMedia = null, adMedia = null, transcript = null, onPreview, onSave, onCancel }) {
+export default function ClipComposer({ segment, index = 0, sourceDuration = 0, sourceUrl = '', sourceWidth = 0, sourceHeight = 0, outputAspectRatio = '9:16', bannerMedia = null, adMedia = null, transcript = null, onPreview, onSave, onCancel }) {
   const durationLimit = Math.max(Number(sourceDuration) || Number(segment.end) || 0, Number(segment.end) || 0);
   const initial = normalizeComposition(segment.composition, segment, durationLimit) || createDefaultComposition(segment, outputAspectRatio);
   const [composition, setComposition] = useState(initial);
@@ -36,6 +40,8 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
   const activeLayer = composition[selectedLayer];
   const activeRect = activeLayer?.destination;
   const contextWords = useMemo(() => (transcript?.words || []).filter((word) => word.end >= composition.source_start - 15 && word.start <= composition.source_end + 15), [transcript, composition.source_start, composition.source_end]);
+  const bannerMatches = mediaMatchesLayer(composition.banner_layer, bannerMedia);
+  const adMatches = mediaMatchesLayer(composition.ad_layer, adMedia);
 
   const setSourceRange = (startValue, endValue) => {
     const start = clamp(Number(startValue), 0, Math.max(0, durationLimit - 0.5));
@@ -65,10 +71,14 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
   };
 
   const enableLayer = (name) => {
-    if (name === 'banner_layer' && !bannerMedia?.url) return;
-    if (name === 'ad_layer' && !adMedia?.url) return;
+    const media = name === 'ad_layer' ? adMedia : bannerMedia;
+    if (!media?.url || !media?.revision) return;
     const extra = name === 'ad_layer' ? { mode: 'overlay' } : {};
-    setComposition((current) => updateCompositionLayer(current, name, current[name] || defaultOverlay(compositionDuration(current), extra)));
+    setComposition((current) => updateCompositionLayer(current, name, {
+      ...(current[name] || defaultOverlay(compositionDuration(current), extra)),
+      enabled: true,
+      asset_revision: media.revision,
+    }));
     setSelectedLayer(name);
   };
 
@@ -113,12 +123,14 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
         <div className="segment-editor-header"><div><div className="arkaim-eyebrow">КОМПОЗИТОР КЛИПА</div><h3>Редактирование момента #{index + 1}</h3></div><button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>✕</button></div>
         <div className="clip-composer-grid">
           <div className="clip-composer-preview-column">
-            <CompositionCanvas sourceUrl={sourceUrl} previewTime={composition.source_start} composition={composition} selectedLayer={selectedLayer} bannerMedia={bannerMedia} adMedia={adMedia} onCompositionChange={setComposition} />
+            <CompositionCanvas sourceUrl={sourceUrl} previewTime={composition.source_start} composition={composition} selectedLayer={selectedLayer} bannerMedia={bannerMatches ? bannerMedia : null} adMedia={adMatches ? adMedia : null} sourceWidth={sourceWidth} sourceHeight={sourceHeight} onCompositionChange={setComposition} />
             <div className="composition-layer-tabs">
               <button type="button" className={`btn btn-sm ${selectedLayer === 'main_layer' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setSelectedLayer('main_layer')}>Основное видео</button>
-              <button id="btn-enable-banner-layer" type="button" disabled={!bannerMedia?.url} className={`btn btn-sm ${selectedLayer === 'banner_layer' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => enableLayer('banner_layer')}>Видео-баннер</button>
-              <button id="btn-enable-ad-layer" type="button" disabled={!adMedia?.url} className={`btn btn-sm ${selectedLayer === 'ad_layer' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => enableLayer('ad_layer')}>Видео-реклама</button>
+              <button id="btn-enable-banner-layer" type="button" disabled={!bannerMedia?.url || !bannerMedia?.revision} className={`btn btn-sm ${selectedLayer === 'banner_layer' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => enableLayer('banner_layer')}>Видео-баннер</button>
+              <button id="btn-enable-ad-layer" type="button" disabled={!adMedia?.url || !adMedia?.revision} className={`btn btn-sm ${selectedLayer === 'ad_layer' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => enableLayer('ad_layer')}>Видео-реклама</button>
             </div>
+            {composition.banner_layer && !bannerMatches && <small className="composition-media-warning">Баннер был удалён или заменён. Выберите «Видео-баннер» заново.</small>}
+            {composition.ad_layer && !adMatches && <small className="composition-media-warning">Реклама была удалена или заменена. Выберите «Видео-реклама» заново.</small>}
             {!bannerMedia?.url && !adMedia?.url && <small className="composition-media-hint">Загрузите баннер или рекламу ниже на странице, чтобы добавить видеослой.</small>}
           </div>
           <div className="clip-composer-controls">
