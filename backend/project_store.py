@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import tempfile
 import threading
 import uuid
@@ -21,6 +22,8 @@ SUPPORTED_EDITOR_FIELDS = frozenset({
     "export_padding", "aspect_ratio", "burn_subtitles", "insert_ad",
     "text_ad_enabled", "text_ad_text", "text_ad_position", "text_ad_interval",
     "text_ad_opacity", "video_banner_enabled", "video_banner_height",
+    "streamer_layout_enabled", "webcam_region", "gameplay_region",
+    "webcam_height_ratio",
 })
 
 DEFAULT_EDITOR = {
@@ -40,6 +43,10 @@ DEFAULT_EDITOR = {
     "text_ad_opacity": 0.75,
     "video_banner_enabled": False,
     "video_banner_height": 380,
+    "streamer_layout_enabled": False,
+    "webcam_region": None,
+    "gameplay_region": None,
+    "webcam_height_ratio": 0.35,
 }
 
 _VIDEO_SCALAR_FIELDS = frozenset({
@@ -54,10 +61,13 @@ _EDITOR_STRING_FIELDS = frozenset({
 })
 _EDITOR_BOOLEAN_FIELDS = frozenset({
     "burn_subtitles", "insert_ad", "text_ad_enabled", "video_banner_enabled",
+    "streamer_layout_enabled",
 })
 _EDITOR_NUMBER_FIELDS = frozenset({
     "export_padding", "text_ad_interval", "text_ad_opacity", "video_banner_height",
+    "webcam_height_ratio",
 })
+_EDITOR_REGION_FIELDS = frozenset({"webcam_region", "gameplay_region"})
 _SENSITIVE_EDITOR_KEY_PARTS = (
     "api_key", "token", "secret", "password", "credential", "subscription",
     "oauth", "private_key",
@@ -130,6 +140,18 @@ class ProjectStore:
             return candidate.relative_to(self.project_root).as_posix()
         except ValueError as exc:
             raise ValueError("source_path must stay below the project root") from exc
+
+    def _stored_source_path(self, source_path: str | Path) -> Path:
+        """Validate a stored relative path without following its final symlink."""
+        raw_path = Path(source_path)
+        if not str(source_path) or raw_path.is_absolute():
+            raise ValueError("stored source_path must be relative")
+        normalized = Path(os.path.abspath(self.project_root / raw_path))
+        try:
+            normalized.relative_to(self.project_root)
+        except ValueError as exc:
+            raise ValueError("source_path must stay below the project root") from exc
+        return normalized
 
     @staticmethod
     def _safe_scalar(value: Any) -> bool:
@@ -249,6 +271,10 @@ class ProjectStore:
             if value is None:
                 return None
             return self._sanitize_editor_value(value) if isinstance(value, (dict, list)) else _UNSAFE_EDITOR_VALUE
+        if field in _EDITOR_REGION_FIELDS:
+            if value is None:
+                return None
+            return self._sanitize_editor_value(value) if isinstance(value, dict) else _UNSAFE_EDITOR_VALUE
         if field in _EDITOR_STRING_FIELDS:
             return self._sanitize_editor_value(value) if isinstance(value, str) else _UNSAFE_EDITOR_VALUE
         if field in _EDITOR_BOOLEAN_FIELDS:
@@ -387,6 +413,26 @@ class ProjectStore:
             project["updated_at"] = self._utc_now()
             self._atomic_write_json(destination, project)
         return self.get_project(normalized_id)
+
+    def delete_project(self, project_id: str) -> None:
+        """Permanently remove one project record and its owned source file."""
+        normalized_id = self._validate_id(project_id)
+        project_directory = self._project_dir(normalized_id)
+        with self._project_lock(normalized_id):
+            project = self._read_json(project_directory / "project.json")
+            self._validate_project_schema(project, normalized_id)
+            source_path = self._stored_source_path(project.get("source_path"))
+            if source_path.is_symlink():
+                source_path.unlink()
+            else:
+                resolved_source = source_path.resolve()
+                resolved_source.relative_to(self.project_root)
+                if resolved_source.is_file():
+                    resolved_source.unlink()
+            shutil.rmtree(project_directory)
+
+        with self._locks_guard:
+            self._locks.pop(normalized_id, None)
 
     def source_status(self, project_id: str) -> dict[str, Any]:
         """Report whether a stored source path still resolves to a regular file."""

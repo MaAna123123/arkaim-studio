@@ -32,17 +32,17 @@ export default class ErrorBoundary extends Component {
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'center',
-          background: '#090b10',
-          color: '#f0f4fc',
-          fontFamily: '"Montserrat", "Inter", system-ui, sans-serif',
+          background: '#050505',
+          color: '#f5f5f2',
+          fontFamily: '"Manrope", "Segoe UI", system-ui, sans-serif',
           padding: 24,
           textAlign: 'center',
         }}>
-          <div style={{ fontSize: 64, marginBottom: 16 }}>⚠️</div>
+          <div style={{ width: 44, height: 3, background: '#f2c66e', marginBottom: 24 }} />
           <h2 style={{ fontSize: 24, fontWeight: 800, marginBottom: 12 }}>
             Произошла ошибка при отображении интерфейса
           </h2>
-          <p style={{ color: '#94a3b8', maxWidth: 480, marginBottom: 24, fontSize: 14, lineHeight: 1.6 }}>
+          <p style={{ color: '#b7b7b1', maxWidth: 480, marginBottom: 24, fontSize: 14, lineHeight: 1.6 }}>
             Возможно, накопились устаревшие данные в кэше браузера. Нажмите кнопку ниже, чтобы сбросить кэш и перезапустить приложение.
           </p>
           <div style={{
@@ -62,18 +62,17 @@ export default class ErrorBoundary extends Component {
           <button
             onClick={this.handleReset}
             style={{
-              background: 'linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)',
-              color: '#ffffff',
+              background: '#f3f3ef',
+              color: '#080808',
               border: 'none',
-              borderRadius: 10,
+              borderRadius: 8,
               padding: '12px 28px',
               fontSize: 15,
               fontWeight: 700,
               cursor: 'pointer',
-              boxShadow: '0 4px 14px rgba(99, 102, 241, 0.4)',
             }}
           >
-            🔄 Сбросить кэш и перезапустить
+            Сбросить кэш и перезапустить
           </button>
         </div>
       );

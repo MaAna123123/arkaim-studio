@@ -1,4 +1,6 @@
+import { normalizeCropRegion, normalizeWebcamHeightRatio } from './streamerLayout.js';
 import { normalizeComposition } from './clipComposition.js';
+
 const DEFAULT_EDITOR_STATE = {
   segments: [],
   selected: [],
@@ -16,6 +18,10 @@ const DEFAULT_EDITOR_STATE = {
   text_ad_opacity: 0.75,
   video_banner_enabled: false,
   video_banner_height: 380,
+  streamer_layout_enabled: false,
+  webcam_region: null,
+  gameplay_region: null,
+  webcam_height_ratio: 0.35,
 };
 
 function objectOrEmpty(value) {
@@ -111,6 +117,16 @@ export function mapProjectToEditorState(project) {
     videoBannerHeight: numberOrDefault(
       editor.video_banner_height,
       DEFAULT_EDITOR_STATE.video_banner_height,
+    ),
+    streamerLayoutEnabled: booleanOrDefault(
+      editor.streamer_layout_enabled,
+      DEFAULT_EDITOR_STATE.streamer_layout_enabled,
+    ),
+    webcamRegion: normalizeCropRegion(editor.webcam_region),
+    gameplayRegion: normalizeCropRegion(editor.gameplay_region),
+    webcamHeightRatio: normalizeWebcamHeightRatio(
+      editor.webcam_height_ratio,
+      DEFAULT_EDITOR_STATE.webcam_height_ratio,
     ),
     transcription: cloneProjectValue(objectOrEmpty(source.transcription)),
     shouldStartTranscription: false,

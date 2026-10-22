@@ -30,7 +30,7 @@ export default function OperationPanel({
     <div className="glass-card operation-panel" aria-live="polite">
       <div className="operation-panel-header">
         <div>
-          <div className="operation-panel-title">🎙️ Whisper распознаёт речь</div>
+          <div className="operation-panel-title">Whisper распознаёт речь</div>
           <div className={`operation-status operation-status-${operation?.status || 'failed'}`}>
             {pendingAction === 'pause'
               ? 'Приостанавливается…'
@@ -76,7 +76,7 @@ export default function OperationPanel({
               disabled={Boolean(pendingAction)}
               onClick={() => run(onPause)}
             >
-              ⏸ Пауза
+              Пауза
             </button>
           )}
           {actions.includes('resume') && (
@@ -85,7 +85,7 @@ export default function OperationPanel({
               disabled={Boolean(pendingAction)}
               onClick={() => run(onResume)}
             >
-              ▶ Продолжить
+              Продолжить
             </button>
           )}
           {actions.includes('stop') && (
@@ -94,7 +94,7 @@ export default function OperationPanel({
               disabled={Boolean(pendingAction)}
               onClick={() => run(onStop)}
             >
-              ⏹ Остановить с сохранением прогресса
+              Остановить с сохранением прогресса
             </button>
           )}
         </div>

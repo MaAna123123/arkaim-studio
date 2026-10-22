@@ -33,6 +33,10 @@ test('project details hydrate the editor with a Set selection and saved options'
       text_ad_opacity: 0.5,
       video_banner_enabled: true,
       video_banner_height: 240,
+      streamer_layout_enabled: true,
+      webcam_region: { x: 0.02, y: 0.04, width: 0.3, height: 0.28 },
+      gameplay_region: { x: 0.18, y: 0.1, width: 0.72, height: 0.84 },
+      webcam_height_ratio: 0.38,
     },
   });
 
@@ -55,6 +59,10 @@ test('project details hydrate the editor with a Set selection and saved options'
   assert.equal(state.textAdOpacity, 0.5);
   assert.equal(state.videoBannerEnabled, true);
   assert.equal(state.videoBannerHeight, 240);
+  assert.equal(state.streamerLayoutEnabled, true);
+  assert.deepEqual(state.webcamRegion, { x: 0.02, y: 0.04, width: 0.3, height: 0.28 });
+  assert.deepEqual(state.gameplayRegion, { x: 0.18, y: 0.1, width: 0.72, height: 0.84 });
+  assert.equal(state.webcamHeightRatio, 0.38);
   assert.deepEqual(state.transcript, { has_transcript: true });
 });
 
@@ -78,6 +86,10 @@ test('older incomplete project records receive safe editor defaults and never au
   assert.equal(state.textAdOpacity, 0.75);
   assert.equal(state.videoBannerEnabled, false);
   assert.equal(state.videoBannerHeight, 380);
+  assert.equal(state.streamerLayoutEnabled, false);
+  assert.equal(state.webcamRegion, null);
+  assert.equal(state.gameplayRegion, null);
+  assert.equal(state.webcamHeightRatio, 0.35);
   assert.equal(state.shouldStartTranscription, false);
 });
 

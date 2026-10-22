@@ -52,19 +52,19 @@ export default function VideoUploader({ onVideoSelect, onResetVideo, currentVide
         className="video-info-bar glass-card"
         id="video-info-bar"
       >
-        <div className="video-info-thumb">🎬</div>
+        <div className="video-info-thumb" aria-hidden="true" />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="video-info-name" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {currentVideo.filename}
           </div>
           <div className="video-info-meta">
-            <span>⏱ {fmtDuration(meta.duration)}</span>
-            <span>📐 {meta.width}×{meta.height}</span>
-            <span>🎞 {meta.fps} fps</span>
-            <span>💾 {fmtBytes(meta.size_bytes)}</span>
+            <span>{fmtDuration(meta.duration)}</span>
+            <span>{meta.width}×{meta.height}</span>
+            <span>{meta.fps} fps</span>
+            <span>{fmtBytes(meta.size_bytes)}</span>
           </div>
         </div>
-        <div className="badge badge-green">✓ Загружено</div>
+        <div className="badge badge-green">Загружено</div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <button
             id="btn-replace-local-file"
@@ -73,7 +73,7 @@ export default function VideoUploader({ onVideoSelect, onResetVideo, currentVide
             onClick={openFilePicker}
             title="Загрузить другой файл с компьютера"
           >
-            📁 Заменить файл
+            Заменить файл
           </button>
           {onResetVideo && (
             <button
@@ -83,7 +83,7 @@ export default function VideoUploader({ onVideoSelect, onResetVideo, currentVide
               onClick={onResetVideo}
               title="Сбросить текущее видео и ввести новую ссылку YouTube или выбрать другой файл"
             >
-              🔄 Сбросить / Другое видео
+              Сбросить / Другое видео
             </button>
           )}
         </div>
@@ -123,11 +123,11 @@ export default function VideoUploader({ onVideoSelect, onResetVideo, currentVide
         </>
       ) : (
         <>
-          <span className="uploader-icon">🎬</span>
+          <span className="uploader-icon" aria-hidden="true" />
           <div className="uploader-title">Перетащите видео сюда</div>
           <p className="uploader-subtitle">или нажмите для выбора файла с компьютера</p>
-          <button className="btn btn-primary" onClick={(e) => e.stopPropagation()}>
-            📁 Выбрать видео
+          <button className="btn btn-primary" onClick={(e) => { e.stopPropagation(); inputRef.current?.click(); }}>
+            Выбрать видео
           </button>
           <div className="uploader-formats">
             {FORMATS.map(f => (

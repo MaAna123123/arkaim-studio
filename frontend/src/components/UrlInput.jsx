@@ -6,7 +6,6 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
   const [url, setUrl] = useState('');
   const [quality, setQuality] = useState('720');
   const [aspectRatio, setAspectRatio] = useState('9:16');
-  const [burnSubtitles, setBurnSubtitles] = useState(true);
   const [maxClips, setMaxClips] = useState(10);
 
   const [loadingInfo, setLoadingInfo] = useState(false);
@@ -14,13 +13,29 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
   const [downloading, setDownloading] = useState(false);
   const [info, setInfo] = useState(null);
   const [error, setError] = useState('');
+  const [showSubtitleChoice, setShowSubtitleChoice] = useState(false);
 
   const lastFetched = useRef('');
+  const subtitleDialogRef = useRef(null);
   const busy = loadingInfo || processing || downloading;
 
   useEffect(() => {
     if (onBusyChange) onBusyChange(busy);
   }, [busy, onBusyChange]);
+
+  useEffect(() => {
+    if (!showSubtitleChoice) return undefined;
+    const previousFocus = document.activeElement;
+    subtitleDialogRef.current?.querySelector('button')?.focus();
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') setShowSubtitleChoice(false);
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      previousFocus?.focus?.();
+    };
+  }, [showSubtitleChoice]);
 
   const readError = async (r, fallback) => {
     try {
@@ -47,7 +62,9 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
         body: JSON.stringify({ url: clean }),
       });
       if (!r.ok) throw new Error(await readError(r, 'Не удалось получить информацию о видео'));
-      setInfo(await r.json());
+      const data = await r.json();
+      setInfo(data);
+      return data;
     } catch (err) {
       setError(err.message);
       lastFetched.current = '';
@@ -68,22 +85,51 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
   const handleChange = (e) => {
     const value = e.target.value;
     setUrl(value);
-    if (!value.trim()) {
+    if (value.trim() !== lastFetched.current) {
       setInfo(null);
+    }
+    if (!value.trim()) {
       setError('');
       lastFetched.current = '';
     }
   };
 
-  // Главное действие: ссылка → готовые клипы одним запросом
-  const handleAutoClips = async () => {
+  // Главное действие после явного выбора пользователя.
+  const handleAutoClips = async (withSubtitles) => {
     const clean = url.trim();
     if (!clean) return;
 
+    setShowSubtitleChoice(false);
     setProcessing(true);
     setError('');
 
     try {
+      let currentInfo = info;
+      if (!currentInfo) currentInfo = await fetchInfo(clean);
+      if (!currentInfo) return;
+
+      // Если готовых субтитров нет, Whisper запускает App как управляемую
+      // операцию: там уже доступны пауза, остановка и продолжение с checkpoint.
+      if (withSubtitles && !currentInfo?.transcript_info?.has_transcript) {
+        const downloadResponse = await fetch(`${apiBase}/api/youtube/download`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: clean, quality }),
+        });
+        if (!downloadResponse.ok) {
+          throw new Error(await readError(downloadResponse, 'Ошибка скачивания'));
+        }
+        const downloaded = await downloadResponse.json();
+        onVideoReady({
+          ...downloaded,
+          auto_transcription_request: {
+            aspect_ratio: aspectRatio,
+            max_clips: Number(maxClips) || 10,
+          },
+        });
+        return;
+      }
+
       const r = await fetch(`${apiBase}/api/youtube/auto`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -91,7 +137,7 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
           url: clean,
           quality,
           aspect_ratio: aspectRatio,
-          burn_subtitles: burnSubtitles,
+          burn_subtitles: withSubtitles,
           max_clips: Number(maxClips) || 10,
         }),
       });
@@ -102,6 +148,11 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
     } finally {
       setProcessing(false);
     }
+  };
+
+  const requestSubtitleChoice = () => {
+    if (!url.trim()) return;
+    setShowSubtitleChoice(true);
   };
 
   // Запасной путь: только скачать видео и резать вручную
@@ -133,11 +184,11 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
   return (
     <div className="glass-card p-24">
       <div className="section-title">
-        <div className="section-title-icon">🔗</div>
+        <div className="section-title-icon" aria-hidden="true" />
         Вставить ссылку (YouTube, VK, TikTok, Rutube)
       </div>
 
-      <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+      <div className="url-action-row">
         <input
           id="youtube-url-input"
           type="text"
@@ -147,26 +198,22 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
           onChange={handleChange}
           onPaste={handlePaste}
           onBlur={() => url.trim() && fetchInfo(url)}
-          onKeyDown={(e) => e.key === 'Enter' && (info ? handleAutoClips() : fetchInfo(url))}
+          onKeyDown={(e) => e.key === 'Enter' && (info ? requestSubtitleChoice() : fetchInfo(url))}
           disabled={busy}
         />
         <button
           id="btn-youtube-instant"
           className="btn btn-primary btn-lg"
-          onClick={handleAutoClips}
+          onClick={requestSubtitleChoice}
           disabled={busy || !url.trim()}
-          style={{
-            flexShrink: 0,
-            background: 'linear-gradient(135deg, #7c3aed 0%, #a855f7 100%)',
-            boxShadow: '0 4px 14px rgba(124, 58, 237, 0.4)',
-          }}
+          style={{ flexShrink: 0 }}
         >
-          {processing ? <><div className="spinner" /> Нарезаю...</> : <>⚡ Нарезать клипы</>}
+          {processing ? <><div className="spinner" /> Нарезаю...</> : <>Нарезать клипы</>}
         </button>
       </div>
 
       {/* Настройки нарезки */}
-      <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
+      <div className="url-options-row">
         <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
           Качество
           <select
@@ -210,16 +257,6 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
           </select>
         </label>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
-          <input
-            type="checkbox"
-            checked={burnSubtitles}
-            onChange={(e) => setBurnSubtitles(e.target.checked)}
-            disabled={busy}
-          />
-          Вшить субтитры
-        </label>
-
         {loadingInfo && (
           <span style={{ fontSize: 13, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 6 }}>
             <div className="spinner" style={{ width: 14, height: 14 }} /> Читаю видео...
@@ -229,7 +266,7 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
 
       {error && (
         <div style={{ color: 'var(--danger)', fontSize: 13, marginBottom: 16 }}>
-          ⚠️ {error}
+          {error}
         </div>
       )}
 
@@ -255,19 +292,19 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
               {info.title}
             </div>
             <div style={{ fontSize: 12, color: 'var(--text-secondary)', display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-              <span>⏱ {Math.floor(info.duration / 60)} мин {info.duration % 60} сек</span>
-              {info.uploader && <span>👤 {info.uploader}</span>}
+              <span>{Math.floor(info.duration / 60)} мин {info.duration % 60} сек</span>
+              {info.uploader && <span>{info.uploader}</span>}
               {info.has_chapters && (
-                <span className="badge badge-purple">📑 {info.chapters.length} глав</span>
+                <span className="badge badge-purple">{info.chapters.length} глав</span>
               )}
               {tInfo.has_transcript ? (
                 <span className="badge badge-green">
-                  💬 Субтитры {tInfo.is_auto ? '(авто)' : '(встроенные)'} · {tInfo.segment_count} реплик
+                  Субтитры {tInfo.is_auto ? '(авто)' : '(встроенные)'} · {tInfo.segment_count} реплик
                 </span>
               ) : (
-                <span className="badge">🎙 Субтитров нет — распознаю речь</span>
+                <span className="badge">Субтитров нет — распознаю речь</span>
               )}
-              {clipCount > 0 && <span className="badge">✂️ ~{clipCount} фрагментов</span>}
+              {clipCount > 0 && <span className="badge">~{clipCount} фрагментов</span>}
             </div>
           </div>
 
@@ -277,8 +314,47 @@ export default function UrlInput({ apiBase, onVideoReady, onBusyChange }) {
             disabled={busy}
             title="Только скачать видео, нарезать вручную"
           >
-            {downloading ? <><div className="spinner" /> Загрузка...</> : <>⬇ Только скачать</>}
+            {downloading ? <><div className="spinner" /> Загрузка...</> : <>Только скачать</>}
           </button>
+        </div>
+      )}
+
+      {showSubtitleChoice && (
+        <div className="subtitle-choice-backdrop" role="presentation">
+          <div ref={subtitleDialogRef} className="subtitle-choice-dialog" role="dialog" aria-modal="true" aria-labelledby="subtitle-choice-title">
+            <div className="arkaim-eyebrow">Перед нарезкой</div>
+            <h3 id="subtitle-choice-title">Добавить субтитры в клипы?</h3>
+            <p>
+              Если готовых субтитров нет, Whisper можно будет поставить на паузу,
+              остановить с сохранением прогресса и продолжить позже.
+            </p>
+            <div className="subtitle-choice-actions">
+              <button
+                id="btn-clips-with-subtitles"
+                type="button"
+                className="btn btn-primary"
+                onClick={() => handleAutoClips(true)}
+              >
+                С субтитрами
+              </button>
+              <button
+                id="btn-clips-without-subtitles"
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => handleAutoClips(false)}
+              >
+                Без субтитров
+              </button>
+              <button
+                id="btn-cancel-subtitle-choice"
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => setShowSubtitleChoice(false)}
+              >
+                Отмена
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

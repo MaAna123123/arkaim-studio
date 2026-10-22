@@ -38,6 +38,7 @@ class TranscriptionService:
         self._metadata: dict[str, dict] = {}
         self._futures: dict[str, asyncio.Future] = {}
         self._video_operations: dict[tuple[str, str], str] = {}
+        self._deleting_videos: set[str] = set()
         self._action_locks: dict[str, threading.Lock] = {}
         self._video_action_locks: dict[str, threading.Lock] = {}
         self._lock = threading.RLock()
@@ -51,6 +52,8 @@ class TranscriptionService:
         loop: asyncio.AbstractEventLoop,
     ) -> dict:
         with self._lock:
+            if video_id in self._deleting_videos:
+                raise OperationConflictError("Project is being deleted")
             key = ("transcription", video_id)
             known_id = self._video_operations.get(key)
             if known_id:
@@ -113,6 +116,9 @@ class TranscriptionService:
             raise ValueError("Project storage is required for transcription restart")
 
         with self._video_action_lock(video_id):
+            with self._lock:
+                if video_id in self._deleting_videos:
+                    raise OperationConflictError("Project is being deleted")
             if self.project_store.load_transcript(video_id) is not None:
                 raise OperationConflictError("Completed transcript already exists")
             return self._restart_from_zero_locked(
@@ -123,6 +129,20 @@ class TranscriptionService:
                 loop,
                 previous_operation_id,
             )
+
+    def begin_video_deletion(self, video_id: str) -> None:
+        """Prevent new workers from starting while project files are removed."""
+        with self._video_action_lock(video_id):
+            with self._lock:
+                if video_id in self._deleting_videos:
+                    raise OperationConflictError("Project is already being deleted")
+                self._deleting_videos.add(video_id)
+
+    def abort_video_deletion(self, video_id: str) -> None:
+        """Release a deletion claim when no project file was removed."""
+        with self._video_action_lock(video_id):
+            with self._lock:
+                self._deleting_videos.discard(video_id)
 
     def _restart_from_zero_locked(
         self,
@@ -732,6 +752,33 @@ class TranscriptionService:
             if snapshot["status"] in {"completed", "failed", "stopped", "cancelled"}:
                 return snapshot
             await asyncio.sleep(0.05)
+
+    async def wait_for_idle(self, operation_id: str) -> None:
+        """Wait until the worker has stopped touching project-owned files."""
+        with self._lock:
+            future = self._futures.get(operation_id)
+        if future is not None and not future.done():
+            await asyncio.shield(future)
+
+    def forget(self, operation_id: str) -> None:
+        """Drop all in-memory state after a worker is fully idle."""
+        with self._operation_action_lock(operation_id):
+            with self._lock:
+                future = self._futures.get(operation_id)
+                if future is not None and not future.done():
+                    raise OperationConflictError("Operation worker is still active")
+                metadata = self._metadata.pop(operation_id, None)
+                if metadata is not None:
+                    checkpoint_lease = metadata.get("checkpoint_lease")
+                    if checkpoint_lease is not None:
+                        checkpoint_lease.clear()
+                self._futures.pop(operation_id, None)
+                for key, known_id in list(self._video_operations.items()):
+                    if known_id == operation_id:
+                        self._video_operations.pop(key, None)
+                self.manager.discard(operation_id)
+        with self._lock:
+            self._action_locks.pop(operation_id, None)
 
     async def shutdown(self, timeout: float = 2.0) -> None:
         with self._lock:

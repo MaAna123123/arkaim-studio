@@ -120,6 +120,81 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertEqual(missing.status_code, 404)
 
+    def test_delete_project_removes_all_owned_artifacts_and_keeps_siblings(self):
+        sibling_id = str(uuid.uuid4())
+        directories = {
+            "clips": self.project_root / "backend" / "clips",
+            "thumbs": self.project_root / "backend" / "thumbs",
+            "transcripts": self.project_root / "backend" / "transcripts",
+            "temp": self.project_root / "backend" / "temp",
+        }
+        for directory in directories.values():
+            directory.mkdir(parents=True, exist_ok=True)
+
+        owned = [
+            directories["clips"] / f"{self.project_id}_clip_1.mp4",
+            directories["thumbs"] / f"{self.project_id}_thumb_001.jpg",
+            directories["transcripts"] / f"{self.project_id}.json",
+            directories["transcripts"] / f"{self.project_id}.chapters.json",
+            directories["temp"] / f"{self.project_id}_work.tmp",
+        ]
+        sibling = [
+            directories["clips"] / f"{sibling_id}_clip_1.mp4",
+            directories["thumbs"] / f"{sibling_id}_thumb_001.jpg",
+            directories["transcripts"] / f"{sibling_id}.json",
+            directories["temp"] / f"{sibling_id}_work.tmp",
+        ]
+        for path in owned + sibling:
+            path.write_bytes(b"data")
+
+        with (
+            patch.object(main, "CLIPS_DIR", directories["clips"]),
+            patch.object(main, "THUMBS_DIR", directories["thumbs"]),
+            patch.object(main, "TRANSCRIPTS_DIR", directories["transcripts"]),
+            patch.object(main, "TEMP_DIR", directories["temp"]),
+        ):
+            response = self.client.delete(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "deleted": True,
+            "project_id": self.project_id,
+        })
+        self.assertFalse(self.source.exists())
+        self.assertFalse((self.store.projects_root / self.project_id).exists())
+        self.assertTrue(all(not path.exists() for path in owned))
+        self.assertTrue(all(path.exists() for path in sibling))
+
+    def test_delete_project_unlinks_matching_symlink_without_deleting_sibling_artifact(self):
+        clips = self.project_root / "backend" / "clips"
+        clips.mkdir(parents=True, exist_ok=True)
+        sibling = clips / f"{uuid.uuid4()}_clip_1.mp4"
+        sibling.write_bytes(b"sibling")
+        owned_link = clips / f"{self.project_id}_clip_1.mp4"
+        try:
+            owned_link.symlink_to(sibling)
+        except OSError as exc:
+            self.skipTest(f"Symlinks are unavailable: {exc}")
+
+        with patch.object(main, "CLIPS_DIR", clips):
+            response = self.client.delete(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(owned_link.exists())
+        self.assertTrue(sibling.exists())
+
+    def test_delete_project_keeps_record_retryable_when_artifact_cleanup_fails(self):
+        with patch.object(
+            main,
+            "_delete_project_artifacts",
+            side_effect=OSError("cleanup failed"),
+        ):
+            response = self.client.delete(f"/api/projects/{self.project_id}")
+
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(self.source.exists())
+        self.assertTrue((self.store.projects_root / self.project_id / "project.json").is_file())
+
     def test_patch_project_updates_only_allowlisted_editor_state(self):
         response = self.client.patch(
             f"/api/projects/{self.project_id}",
@@ -371,6 +446,35 @@ class IngestionProjectTests(unittest.TestCase):
         self.assertEqual(project["title"], "Auto lesson")
         self.assertEqual(project["editor"]["segments"], [segment])
         self.assertEqual(project["editor"]["clip_results"], [clip])
+
+    def test_youtube_auto_without_subtitles_does_not_start_whisper(self):
+        segment = {"start": 1.0, "end": 10.0, "label": "Moment"}
+        clip = {"url": "clips/clip-1.mp4"}
+        resolve_transcript = AsyncMock()
+        with (
+            patch.object(main, "yt_get_info", return_value={"title": "Auto lesson"}),
+            patch.object(
+                main,
+                "get_youtube_transcript",
+                return_value={"has_transcript": False, "segments": [], "words": []},
+            ),
+            patch.object(main, "yt_download", side_effect=self._fake_download),
+            patch.object(main, "_resolve_transcript", new=resolve_transcript),
+            patch.object(main, "get_instant_clips", return_value=[segment]),
+            patch.object(main, "_export_segments", new=AsyncMock(return_value=[clip])) as export_segments,
+        ):
+            response = self.client.post(
+                "/api/youtube/auto",
+                json={
+                    "url": "https://www.youtube.com/watch?v=example",
+                    "quality": "720",
+                    "burn_subtitles": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        resolve_transcript.assert_not_awaited()
+        self.assertFalse(export_segments.await_args.kwargs["burn_subtitles"])
 
 
 class RestartPartialTranscriber:

@@ -60,11 +60,26 @@ class VideoProcessor:
         except Exception:
             fps = 30.0
 
+        rotation = video_stream.get("tags", {}).get("rotate", 0)
+        for side_data in video_stream.get("side_data_list", []):
+            if "rotation" in side_data:
+                rotation = side_data["rotation"]
+                break
+        try:
+            rotation = int(round(float(rotation))) % 360
+        except (TypeError, ValueError):
+            rotation = 0
+        width = int(video_stream.get("width", 0))
+        height = int(video_stream.get("height", 0))
+        if rotation in {90, 270}:
+            width, height = height, width
+
         return {
             "duration": duration,
             "fps": fps,
-            "width": int(video_stream.get("width", 0)),
-            "height": int(video_stream.get("height", 0)),
+            "width": width,
+            "height": height,
+            "rotation": rotation,
             "size_bytes": int(fmt.get("size", 0)),
             "codec": video_stream.get("codec_name", "unknown"),
         }
@@ -101,17 +116,46 @@ class VideoProcessor:
 
     # ─── Subtitle ASS Generator ───────────────────────────────────────────────
     def _create_ass_subtitles(
-        self, words: list[dict], t_start: float, t_end: float,
-        play_res_x: int = 720, play_res_y: int = 1280,
+        self,
+        words: list[dict],
+        t_start: float,
+        t_end: float,
+        play_res_x: int = 720,
+        play_res_y: int = 1280,
     ) -> str:
         """Generates temporary ASS subtitle file for FFmpeg subtitle filter."""
         clips_dir = Path(__file__).parent.resolve() / "clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
 
-        clip_words = [
-            w for w in (words or [])
-            if float(w.get("end", 0)) >= t_start and float(w.get("start", 0)) <= t_end
-        ]
+        raw_words = sorted(
+            (
+                {
+                    **w,
+                    "word": str(w.get("word", "")).strip(),
+                    "start": float(w.get("start", 0)),
+                    "end": float(w.get("end", 0)),
+                }
+                for w in (words or [])
+                if str(w.get("word", "")).strip()
+                and float(w.get("end", 0)) >= t_start
+                and float(w.get("start", 0)) <= t_end
+            ),
+            key=lambda item: (item["start"], item["end"]),
+        )
+        clip_words = []
+        for word in raw_words:
+            if word["end"] <= word["start"]:
+                continue
+            if clip_words:
+                previous = clip_words[-1]
+                same_text = word["word"].casefold() == previous["word"].casefold()
+                overlaps = word["start"] < previous["end"] - 0.02
+                if same_text and overlaps:
+                    # YouTube/Whisper can repeat the same word at a segment seam.
+                    # Keep one timing window so ASS never renders it twice.
+                    previous["end"] = max(previous["end"], word["end"])
+                    continue
+            clip_words.append(word)
 
         phrases = []
         curr = []
@@ -138,12 +182,32 @@ class VideoProcessor:
                 cs = 99
             return f"{h}:{m:02d}:{secs:02d}.{cs:02d}"
 
+        phrase_windows = []
+        for phrase in phrases:
+            if not phrase:
+                continue
+            phrase_windows.append({
+                "words": phrase,
+                "start": float(phrase[0].get("start", 0)) - t_start,
+                "end": float(phrase[-1].get("end", 0)) - t_start,
+            })
+        for index in range(len(phrase_windows) - 1):
+            current = phrase_windows[index]
+            following = phrase_windows[index + 1]
+            if current["end"] > following["start"]:
+                boundary = (current["end"] + following["start"]) / 2
+                boundary = max(current["start"] + 0.02, boundary)
+                boundary = min(following["end"] - 0.02, boundary)
+                current["end"] = boundary
+                following["start"] = boundary
+
         events = []
-        for p in phrases:
+        for window in phrase_windows:
+            p = window["words"]
             if not p:
                 continue
-            p_start = float(p[0].get("start", 0)) - t_start
-            p_end = float(p[-1].get("end", 0)) - t_start
+            p_start = window["start"]
+            p_end = window["end"]
             p_text = " ".join([w.get("word", "").strip() for w in p])
             if p_text and p_end > p_start:
                 # Add smooth fade-in and fade-out (\fad(120,120))
@@ -155,6 +219,7 @@ class VideoProcessor:
         shadow = round(2 * resolution_scale, 1)
         horizontal_margin = int(round(30 * resolution_scale))
         vertical_margin = int(round(120 * resolution_scale))
+
         ass_header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {play_res_x}
@@ -340,7 +405,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             "-stream_loop", "-1", "-i", banner_path,
             "-t", str(clip_dur),
             "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "0:a",
+            "-map", "[outv]", "-map", "0:a?",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
             "-c:a", "aac", "-ar", "44100", "-ac", "2",
             "-movflags", "+faststart",
@@ -373,6 +438,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_banner_enabled: bool = False,
         video_banner_path: str = "",
         video_banner_height: int = 380,
+        streamer_layout_enabled: bool = False,
+        webcam_region: dict | None = None,
+        gameplay_region: dict | None = None,
+        webcam_height_ratio: float = 0.35,
         composition: dict | None = None,
         overlay_ad_path: str = "",
     ) -> str:
@@ -426,32 +495,39 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
 
         composition_vertical = bool(composition and composition.get("output_aspect_ratio") == "9:16")
+        use_streamer_layout = streamer_layout_enabled and not composition
         source_width = max(2, int(meta.get("width") or 1280) // 2 * 2)
         source_height = max(2, int(meta.get("height") or 720) // 2 * 2)
-        output_width = 1080 if composition_vertical else (source_width if composition else (720 if aspect_ratio == "9:16" else source_width))
-        output_height = 1920 if composition_vertical else (source_height if composition else (1280 if aspect_ratio == "9:16" else source_height))
+        output_width = 1080 if use_streamer_layout or composition_vertical else (720 if aspect_ratio == "9:16" and not composition else source_width)
+        output_height = 1920 if use_streamer_layout or composition_vertical else (1280 if aspect_ratio == "9:16" and not composition else source_height)
 
         if burn_subtitles and words:
             try:
                 temp_ass_file = self._create_ass_subtitles(
-                    words, t_start, t_end, play_res_x=output_width, play_res_y=output_height
+                    words,
+                    t_start,
+                    t_end,
+                    play_res_x=output_width,
+                    play_res_y=output_height,
                 )
             except Exception:
                 temp_ass_file = None
 
         text_ad_filters = []
         if text_ad_enabled and text_ad_text.strip():
+            clip_w = output_width
+            clip_h = output_height
             text_ad_filters, temp_text_ad_files = self._create_text_ad_filters(
-                text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity,
-                output_width, output_height,
+                text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity, clip_w, clip_h
             )
 
         needs_encode = (
-            aspect_ratio == "9:16" or temp_ass_file or title_filter or text_ad_filters or composition
+            aspect_ratio == "9:16" or temp_ass_file or title_filter or text_ad_filters
+            or use_streamer_layout or composition
         )
 
         filters = ["setpts=PTS-STARTPTS"]
-        if aspect_ratio == "9:16":
+        if aspect_ratio == "9:16" and not use_streamer_layout:
             filters.extend([
                 "scale=720:1280:force_original_aspect_ratio=decrease",
                 "pad=720:1280:(ow-iw)/2:(oh-ih)/2:black",
@@ -471,6 +547,54 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_filter_args = ["-vf", ",".join(filters)]
         video_map_args = []
         overlay_input_args = []
+        if use_streamer_layout:
+            if aspect_ratio != "9:16" or webcam_region is None or gameplay_region is None:
+                raise ValueError("Для компоновки стримера нужны две области и формат 9:16")
+            source_w = int(meta.get("width") or 0)
+            source_h = int(meta.get("height") or 0)
+            if source_w <= 0 or source_h <= 0:
+                raise ValueError("Не удалось определить размер исходного видео")
+
+            def crop_pixels(region: dict) -> tuple[int, int, int, int]:
+                values = region.model_dump() if hasattr(region, "model_dump") else region
+                x = max(0, int(round(float(values["x"]) * source_w)))
+                y = max(0, int(round(float(values["y"]) * source_h)))
+                width = max(2, int(round(float(values["width"]) * source_w)))
+                height = max(2, int(round(float(values["height"]) * source_h)))
+                x -= x % 2
+                y -= y % 2
+                width -= width % 2
+                height -= height % 2
+                width = min(width, source_w - x)
+                height = min(height, source_h - y)
+                width -= width % 2
+                height -= height % 2
+                if width < 2 or height < 2:
+                    raise ValueError("Выбранная область слишком мала")
+                return width, height, x, y
+
+            webcam_crop = crop_pixels(webcam_region)
+            gameplay_crop = crop_pixels(gameplay_region)
+            webcam_h = int(round(output_height * float(webcam_height_ratio) / 2) * 2)
+            webcam_h = max(384, min(960, webcam_h))
+            gameplay_h = output_height - webcam_h
+            post_filters = filters[1:]
+            filter_complex = (
+                "[0:v]split=2[webcam_in][gameplay_in];"
+                f"[webcam_in]crop={webcam_crop[0]}:{webcam_crop[1]}:{webcam_crop[2]}:{webcam_crop[3]},"
+                f"scale={output_width}:{webcam_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+                f"crop={output_width}:{webcam_h},setsar=1[webcam];"
+                f"[gameplay_in]crop={gameplay_crop[0]}:{gameplay_crop[1]}:{gameplay_crop[2]}:{gameplay_crop[3]},"
+                f"scale={output_width}:{gameplay_h}:force_original_aspect_ratio=increase:flags=lanczos,"
+                f"crop={output_width}:{gameplay_h},setsar=1[gameplay];"
+                "[webcam][gameplay]vstack=inputs=2,setpts=PTS-STARTPTS"
+            )
+            if post_filters:
+                filter_complex += "," + ",".join(post_filters)
+            filter_complex += "[outv]"
+            video_filter_args = ["-filter_complex", filter_complex]
+            video_map_args = ["-map", "[outv]", "-map", "0:a?"]
+
         if composition:
             source_w = int(meta.get("width") or 0)
             source_h = int(meta.get("height") or 0)
@@ -503,8 +627,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 post_filters.append(f"subtitles='{escaped_ass}'")
             post_filters.extend(text_ad_filters)
             composition_filter = build_composition_filter(
-                composition, source_w, source_h, output_width, output_height,
-                banner_input, ad_input, post_filters,
+                composition,
+                source_w,
+                source_h,
+                output_width,
+                output_height,
+                banner_input,
+                ad_input,
+                post_filters,
             )
             video_filter_args = ["-filter_complex", composition_filter.filter_complex]
             video_map_args = ["-map", composition_filter.video_map, "-map", "0:a?"]
@@ -519,8 +649,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             *video_map_args,
             "-af", "asetpts=PTS-STARTPTS",
             "-c:v", "libx264",
-            "-preset", "medium" if composition else "ultrafast",
-            "-crf", "18" if composition else "22",
+            "-preset", "medium" if use_streamer_layout or composition else "ultrafast",
+            "-crf", "18" if use_streamer_layout or composition else "22",
             "-pix_fmt", "yuv420p",
             "-threads", "0",
             "-c:a", "aac",
@@ -615,13 +745,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             ad_dur = ad_meta.get("duration") or 5.0
             ad_audio_filter = f"anullsrc=channel_layout=stereo:sample_rate=44100:duration={ad_dur}[a2];"
 
+        clip_has_audio = self._has_audio(clip_path)
+        if clip_has_audio:
+            first_audio_filter = (
+                f"[0:a]atrim=0:{mid_point},asetpts=PTS-STARTPTS,"
+                "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];"
+            )
+            third_audio_filter = (
+                f"[0:a]atrim={mid_point}:{clip_dur},asetpts=PTS-STARTPTS,"
+                "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a3];"
+            )
+        else:
+            first_audio_filter = (
+                f"anullsrc=channel_layout=stereo:sample_rate=44100:duration={mid_point}[a1];"
+            )
+            third_audio_filter = (
+                "anullsrc=channel_layout=stereo:sample_rate=44100:"
+                f"duration={max(0.001, clip_dur - mid_point)}[a3];"
+            )
+
         filter_complex = (
             f"[0:v]trim=0:{mid_point},setpts=PTS-STARTPTS,fps={clip_fps},setsar=1,format=yuv420p[v1];"
-            f"[0:a]atrim=0:{mid_point},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];"
+            f"{first_audio_filter}"
             f"[1:v]{ad_scale},setpts=PTS-STARTPTS,format=yuv420p[v2];"
             f"{ad_audio_filter}"
             f"[0:v]trim={mid_point}:{clip_dur},setpts=PTS-STARTPTS,fps={clip_fps},setsar=1,format=yuv420p[v3];"
-            f"[0:a]atrim={mid_point}:{clip_dur},asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a3];"
+            f"{third_audio_filter}"
             f"[v1][a1][v2][a2][v3][a3]concat=n=3:v=1:a=1[outv][outa]"
         )
 
@@ -660,6 +809,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         video_banner_enabled: bool = False,
         video_banner_path: str = "",
         video_banner_height: int = 380,
+        streamer_layout_enabled: bool = False,
+        webcam_region: dict | None = None,
+        gameplay_region: dict | None = None,
+        webcam_height_ratio: float = 0.35,
         overlay_ad_path: str = "",
         insert_ad_path: str = "",
     ) -> str:
@@ -693,6 +846,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     video_banner_enabled=video_banner_enabled,
                     video_banner_path=video_banner_path,
                     video_banner_height=video_banner_height,
+                    streamer_layout_enabled=streamer_layout_enabled,
+                    webcam_region=webcam_region,
+                    gameplay_region=gameplay_region,
+                    webcam_height_ratio=webcam_height_ratio,
                     composition=seg.get("composition"),
                     overlay_ad_path=overlay_ad_path,
                 )

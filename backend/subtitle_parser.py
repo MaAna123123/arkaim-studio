@@ -88,7 +88,16 @@ def parse_srt_bytes(content: bytes, filename: str = "subtitles.srt") -> dict:
         raise ValueError("Файл субтитров пуст")
 
     decoded = None
-    for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ("utf-16",)
+    elif content[:200].count(b"\x00") > 10:
+        even_nuls = content[:200:2].count(0)
+        odd_nuls = content[1:200:2].count(0)
+        encodings = ("utf-16-le" if odd_nuls > even_nuls else "utf-16-be",)
+    else:
+        encodings = ("utf-8-sig", "utf-8", "cp1251")
+
+    for encoding in encodings:
         try:
             decoded = content.decode(encoding)
             break

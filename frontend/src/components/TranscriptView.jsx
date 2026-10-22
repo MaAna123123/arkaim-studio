@@ -94,7 +94,7 @@ export default function TranscriptView({
       <div className="transcript-header">
         <div>
           <div className="section-title" style={{ marginBottom: 2 }}>
-            <div className="section-title-icon">📝</div>
+            <div className="section-title-icon" aria-hidden="true" />
             Интерактивный транскрипт
           </div>
           <div className="transcript-hint">
@@ -117,7 +117,7 @@ export default function TranscriptView({
         id="transcript-search-input"
         type="text"
         className="input text-sm"
-        placeholder="🔍 Поиск по тексту..."
+        placeholder="Поиск по тексту..."
         value={search}
         onChange={(event) => setSearch(event.target.value)}
       />
@@ -165,7 +165,7 @@ export default function TranscriptView({
           </div>
           <div className="transcript-selection-actions">
             <button className="btn btn-ghost btn-sm" onClick={() => onWordClick(selectedRange.start)}>
-              ▶ Проверить
+              Проверить
             </button>
             <button
               id="btn-cut-transcript-selection"
@@ -173,10 +173,10 @@ export default function TranscriptView({
               disabled={cutting}
               onClick={() => onCutSelection(selectedRange)}
             >
-              {cutting ? <><div className="spinner" /> Нарезаю...</> : <>✂️ Вырезать и скачать</>}
+              {cutting ? <><div className="spinner" /> Нарезаю...</> : <>Вырезать и скачать</>}
             </button>
             <button className="btn btn-ghost btn-sm transcript-clear-selection" onClick={clearSelection} title="Сбросить выделение">
-              ✕
+              ×
             </button>
           </div>
           </div>

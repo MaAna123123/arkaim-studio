@@ -3,12 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>videopril — ИИ-нарезка видео</title>
-    <meta name="description" content="Находите интересные моменты в видео с помощью ИИ и мгновенно нарезайте хайлайты" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@800;900&display=swap" rel="stylesheet" />
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>" />
+    <title>Аркаим Studio — защищённая ИИ-нарезка видео</title>
+    <meta name="description" content="Локальная студия Аркаим для расшифровки, поиска сильных моментов и нарезки вертикальных видео" />
+    <meta name="theme-color" content="#050505" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 112'><path d='M50 3 94 25 85 87 50 109 15 87 6 25Z' fill='%2308171d' stroke='%235ee5e8' stroke-width='5'/><text x='50' y='73' text-anchor='middle' font-family='Arial' font-size='54' font-weight='900' fill='%23f2c66e'>A</text></svg>" />
   </head>
   <body>
     <div id="root"></div>
@@ -16,11 +14,11 @@
       window.addEventListener('error', function(e) {
         var el = document.getElementById('root');
         if (el && (!el.children || el.children.length === 0)) {
-          el.innerHTML = '<div style="background:#090b10;color:#ff8888;padding:32px;font-family:sans-serif;text-align:center;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;">' +
-            '<h2 style="font-size:24px;margin-bottom:12px;">⚠️ Ошибка загрузки приложения</h2>' +
-            '<p style="color:#94a3b8;max-width:500px;margin-bottom:20px;font-size:14px;line-height:1.5;">' + (e.message || 'Не удалось инициализировать скрипты') + '</p>' +
-            '<button onclick="localStorage.clear();location.reload(true);" style="background:linear-gradient(135deg, #6366f1, #4f46e5);color:#fff;border:none;padding:12px 24px;border-radius:8px;cursor:pointer;font-weight:bold;font-size:14px;box-shadow:0 4px 14px rgba(99,102,241,0.4);">' +
-            '🔄 Сбросить кэш и обновить страницу</button>' +
+          el.innerHTML = '<div style="background:#050505;color:#ff9299;padding:32px;font-family:Segoe UI,sans-serif;text-align:center;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;">' +
+            '<h2 style="font-size:24px;margin-bottom:12px;color:#f5f5f2;">Ошибка загрузки приложения</h2>' +
+            '<p style="color:#b7b7b1;max-width:500px;margin-bottom:20px;font-size:14px;line-height:1.5;">' + (e.message || 'Не удалось инициализировать скрипты') + '</p>' +
+            '<button onclick="localStorage.clear();location.reload(true);" style="background:#f3f3ef;color:#080808;border:none;padding:12px 24px;border-radius:8px;cursor:pointer;font-weight:700;font-size:14px;">' +
+            'Сбросить кэш и обновить страницу</button>' +
             '</div>';
         }
       });

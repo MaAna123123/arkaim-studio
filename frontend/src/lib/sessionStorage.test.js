@@ -107,6 +107,10 @@ test('project autosave waits 700 ms and sends only the allow-listed editor paylo
     textAdOpacity: 0.6,
     videoBannerEnabled: true,
     videoBannerHeight: 240,
+    streamerLayoutEnabled: true,
+    webcamRegion: { x: 0.02, y: 0.04, width: 0.3, height: 0.28 },
+    gameplayRegion: { x: 0.18, y: 0.1, width: 0.72, height: 0.84 },
+    webcamHeightRatio: 0.38,
     playerTime: 91,
     progress: { pct: 37 },
     transcribing: true,
@@ -138,6 +142,10 @@ test('project autosave waits 700 ms and sends only the allow-listed editor paylo
       text_ad_opacity: 0.6,
       video_banner_enabled: true,
       video_banner_height: 240,
+      streamer_layout_enabled: true,
+      webcam_region: { x: 0.02, y: 0.04, width: 0.3, height: 0.28 },
+      gameplay_region: { x: 0.18, y: 0.1, width: 0.72, height: 0.84 },
+      webcam_height_ratio: 0.38,
     },
   }]);
   assert.deepEqual(buildProjectEditorPatch(editor), saves[0].payload);

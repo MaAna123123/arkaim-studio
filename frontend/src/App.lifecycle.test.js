@@ -300,6 +300,12 @@ function buttonInCard(card, text) {
   return button;
 }
 
+function buttonByAriaLabel(card, label) {
+  const button = card.findAllByType('button').find((candidate) => candidate.props['aria-label'] === label);
+  assert.ok(button, `expected card button with aria-label: ${label}`);
+  return button;
+}
+
 async function answerRecentProjects(transport, projects) {
   const request = transport.requestsFor('/api/projects').at(-1);
   assert.ok(request, 'the App should request recent projects');
@@ -510,6 +516,10 @@ test('mounted App only autosaves an editor change after 700ms and cancels pendin
     text_ad_opacity: 0.75,
     video_banner_enabled: false,
     video_banner_height: 380,
+    streamer_layout_enabled: false,
+    webcam_region: null,
+    gameplay_region: null,
+    webcam_height_ratio: 0.35,
   });
   await answerDetail(firstPatch, {});
 
@@ -591,6 +601,59 @@ test('mounted App automatically enables a freshly uploaded video banner for the 
   const exportRequest = transport.requestsFor('/api/video/export', 'POST')[0];
   assert.ok(exportRequest, 'the export action should call the backend');
   assert.equal(JSON.parse(exportRequest.options.body).video_banner_enabled, true);
+});
+
+test('mounted App enables streamer layout and exports both selected regions', async (t) => {
+  const { renderer, transport } = await mountApp(t);
+
+  await answerLatestHealth(transport, true);
+  await answerRecentProjects(transport, [recentProject('project-a', 'Streamer A')]);
+  await act(async () => {
+    buttonByText(renderer, 'Открыть').props.onClick();
+    await flush();
+  });
+  await answerDetail(transport.detailRequests('project-a').at(-1), project('project-a', 'Streamer A'));
+
+  const toggles = renderer.root.findAllByProps({ id: 'btn-toggle-streamer-layout' });
+  assert.equal(toggles.length, 1, 'the editor should expose streamer layout controls');
+  await act(async () => {
+    renderer.root.findByProps({ id: 'btn-ratio-original' }).props.onClick();
+    await flush();
+  });
+  await act(async () => {
+    toggles[0].props.onClick();
+    await flush();
+  });
+  assert.equal(renderer.root.findAllByProps({ id: 'btn-select-webcam' }).length, 1);
+  assert.equal(renderer.root.findAllByProps({ id: 'btn-select-gameplay' }).length, 1);
+  assert.equal(
+    renderer.root.findByProps({ id: 'btn-ratio-original' }).props.disabled,
+    true,
+    'streamer layout must keep export locked to 9:16',
+  );
+
+  await act(async () => {
+    renderer.root.findByProps({ id: 'btn-export-separate' }).props.onClick();
+    await flush();
+  });
+  const exportRequest = transport.requestsFor('/api/video/export', 'POST')[0];
+  assert.ok(exportRequest);
+  const body = JSON.parse(exportRequest.options.body);
+  assert.equal(body.aspect_ratio, '9:16');
+  assert.equal(body.streamer_layout_enabled, true);
+  assert.deepEqual(body.webcam_region, { x: 0.02, y: 0.02, width: 0.3, height: 0.3 });
+  assert.deepEqual(body.gameplay_region, { x: 0, y: 0, width: 1, height: 1 });
+  assert.equal(body.webcam_height_ratio, 0.35);
+
+  await act(async () => {
+    toggles[0].props.onClick();
+    await flush();
+  });
+  assert.match(
+    renderer.root.findByProps({ id: 'btn-ratio-original' }).props.className,
+    /btn-primary/,
+    'disabling streamer layout must restore the user\'s original base format',
+  );
 });
 
 test('mounted recent-project navigation aborts A autosave and a late A failure cannot affect B', async (t) => {
@@ -691,6 +754,39 @@ test('mounted App scopes restart pending state to the project and ignores late r
     true,
     'only the correctly identified restart snapshot updates its project',
   );
+});
+
+test('mounted App removes only the confirmed project card after backend deletion succeeds', async (t) => {
+  const { renderer, transport } = await mountApp(t);
+  const projects = [
+    recentProject('project-a', 'Delete A'),
+    recentProject('project-b', 'Keep B'),
+  ];
+
+  await answerLatestHealth(transport, true);
+  await answerRecentProjects(transport, projects);
+  await act(async () => {
+    buttonInCard(recentProjectCardByTitle(renderer, 'Delete A'), 'Удалить').props.onClick();
+    await flush();
+  });
+
+  const deletion = transport.requestsFor('/api/projects/project-a', 'DELETE')[0];
+  assert.ok(deletion, 'confirmed deletion should use the project endpoint');
+  assert.equal(
+    buttonByAriaLabel(
+      recentProjectCardByTitle(renderer, 'Delete A'),
+      'Удалить проект «Delete A»',
+    ).props.disabled,
+    true,
+    'only the deleting card should be disabled while the request is pending',
+  );
+  await answerDetail(deletion, { deleted: true, project_id: 'project-a' });
+
+  assert.equal(
+    renderer.root.findAllByType('h3').some((heading) => heading.props.title === 'Delete A'),
+    false,
+  );
+  assert.ok(recentProjectCardByTitle(renderer, 'Keep B'));
 });
 
 for (const invalidRestart of [

@@ -8,13 +8,16 @@ export default function Header({ online, onSettings }) {
           title="Нажми для обновления страницы"
           onClick={() => window.location.reload()}
         >
-          <div className="header-logo-icon">🎬</div>
-          <span className="header-logo-text">videopril</span>
+          <div className="header-logo-icon" aria-hidden="true">A</div>
+          <span className="header-brand-copy">
+            <span className="header-logo-text">Аркаим Studio</span>
+            <span className="header-logo-subtitle">Локальный видеоредактор</span>
+          </span>
         </div>
 
         <div className="header-status">
           <div className={`status-dot ${online ? 'online' : 'offline'}`} />
-          <span>{online ? 'Сервер онлайн' : 'Сервер офлайн'}</span>
+          <span>{online ? 'Локальный контур защищён' : 'Backend недоступен'}</span>
         </div>
 
         <div className="header-actions">
@@ -23,7 +26,7 @@ export default function Header({ online, onSettings }) {
             id="btn-settings"
             onClick={onSettings}
           >
-            ⚙️ Настройки
+            Настройки
           </button>
         </div>
       </div>

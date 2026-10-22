@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import './App.css';
+import './ArkaimStudio.css';
 
 import Header from './components/Header';
 import VideoUploader from './components/VideoUploader';
@@ -15,9 +15,11 @@ import AdManager from './components/AdManager';
 import SocialSharePanel from './components/SocialSharePanel';
 import OperationPanel from './components/OperationPanel';
 import RecentProjects from './components/RecentProjects';
+import StreamerLayoutEditor from './components/StreamerLayoutEditor';
 import useOperation, { isUnfinishedTranscription } from './hooks/useOperation';
 import { mapProjectToEditorState } from './lib/projectState';
 import { serializeExportSegment } from './lib/clipComposition';
+import { normalizeCropRegion, normalizeWebcamHeightRatio } from './lib/streamerLayout';
 import {
   canUseRecentProjects,
   createProjectLifecycleController,
@@ -32,6 +34,8 @@ import {
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 const SESSION_KEY = 'videopril.session.v1';
+const DEFAULT_WEBCAM_REGION = { x: 0.02, y: 0.02, width: 0.3, height: 0.3 };
+const DEFAULT_GAMEPLAY_REGION = { x: 0, y: 0, width: 1, height: 1 };
 function loadStoredSession() {
   if (typeof window !== 'undefined' && window.location.search.includes('reset=1')) {
     clearSession(window.sessionStorage);
@@ -124,25 +128,33 @@ export default function App({ recentProjectsOverride = null } = {}) {
 
   const [playerTime, setPlayerTime] = useState(0);
   const [playerSeekTo, setPlayerSeekTo] = useState(null);
-  const [insertAd, setInsertAd] = useState(false);
+  const [insertAd, setInsertAd] = useState(() => restoredSession.insertAd ?? false);
   const [adMedia, setAdMedia] = useState(null);
   const hasAd = Boolean(adMedia?.has_media);
 
   // ── Text Ad Overlay State ──────────────────────────────────────────────────
-  const [textAdEnabled, setTextAdEnabled] = useState(false);
+  const [textAdEnabled, setTextAdEnabled] = useState(() => restoredSession.textAdEnabled ?? false);
   const [textAdText, setTextAdText] = useState(() => restoredSession.textAdText ?? "");
   const [textAdPosition, setTextAdPosition] = useState(() => restoredSession.textAdPosition || 'top');
   const [textAdInterval, setTextAdInterval] = useState(() => (typeof restoredSession.textAdInterval === 'number' ? restoredSession.textAdInterval : 4));
   const [textAdOpacity, setTextAdOpacity] = useState(() => (typeof restoredSession.textAdOpacity === 'number' ? restoredSession.textAdOpacity : 0.75));
 
   // ── Video Banner State ─────────────────────────────────────────────────────
-  const [videoBannerEnabled, setVideoBannerEnabled] = useState(false);
+  const [videoBannerEnabled, setVideoBannerEnabled] = useState(() => restoredSession.videoBannerEnabled ?? false);
   const [bannerMedia, setBannerMedia] = useState(null);
   const hasVideoBanner = Boolean(bannerMedia?.has_media);
-  const [videoBannerHeight, setVideoBannerHeight] = useState(380);
+  const [videoBannerHeight, setVideoBannerHeight] = useState(() => (typeof restoredSession.videoBannerHeight === 'number' ? restoredSession.videoBannerHeight : 380));
+
+  // ── Streamer Layout State ─────────────────────────────────────────────────
+  const [streamerLayoutEnabled, setStreamerLayoutEnabled] = useState(() => restoredSession.streamerLayoutEnabled ?? false);
+  const [webcamRegion, setWebcamRegion] = useState(() => normalizeCropRegion(restoredSession.webcamRegion));
+  const [gameplayRegion, setGameplayRegion] = useState(() => normalizeCropRegion(restoredSession.gameplayRegion));
+  const [webcamHeightRatio, setWebcamHeightRatio] = useState(() => normalizeWebcamHeightRatio(restoredSession.webcamHeightRatio));
+  const effectiveAspectRatio = streamerLayoutEnabled ? '9:16' : aspectRatio;
 
   const wsRef = useRef(null);
   const subtitleInputRef = useRef(null);
+  const exportInFlightRef = useRef(false);
   const afterChapterImportRef = useRef(false);
   const selectedVideoIdRef = useRef(video?.video_id);
   const pendingResumeOperationIdRef = useRef(null);
@@ -152,6 +164,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
   const autosaveSchedulerRef = useRef(null);
   const suppressNextAutosaveRef = useRef(false);
   const projectLifecycleRef = useRef(null);
+  const pendingAutoPipelineRef = useRef(null);
+  const continueAutoPipelineRef = useRef(null);
   const restoreCandidateRef = useRef(
     restoredSession.video?.video_id
       ? {
@@ -187,6 +201,11 @@ export default function App({ recentProjectsOverride = null } = {}) {
           : 'Полный транскрипт готов. Выделяйте текст справа для ручной нарезки.',
       );
       afterChapterImportRef.current = false;
+      const pendingAuto = pendingAutoPipelineRef.current;
+      if (pendingAuto?.videoId === requestedVideoId) {
+        pendingAutoPipelineRef.current = null;
+        Promise.resolve().then(() => continueAutoPipelineRef.current?.(pendingAuto, data));
+      }
     } catch {
       // The operation panel keeps the completed state; polling can retry the file.
     }
@@ -208,6 +227,22 @@ export default function App({ recentProjectsOverride = null } = {}) {
     onCompleted: handleTranscriptionCompleted,
   });
   const transcribing = isUnfinishedTranscription(transcriptionOperation);
+
+  useEffect(() => {
+    const pending = pendingAutoPipelineRef.current;
+    if (!pending || pending.videoId !== video?.video_id || pending.stage !== 'queued') return;
+    pending.stage = 'starting';
+    setSubtitleNotice('Готовых субтитров нет. Запускаю управляемое распознавание Whisper...');
+    startTranscription()
+      .then((operation) => {
+        if (!operation && pendingAutoPipelineRef.current === pending) pending.stage = 'queued';
+        else if (pendingAutoPipelineRef.current === pending) pending.stage = 'transcribing';
+      })
+      .catch((error) => {
+        if (pendingAutoPipelineRef.current === pending) pending.stage = 'queued';
+        setProjectError(`Не удалось запустить Whisper: ${error.message}`);
+      });
+  }, [startTranscription, video?.video_id]);
 
   const cancelProjectAutosave = useCallback(() => {
     autosaveGenerationRef.current += 1;
@@ -244,6 +279,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
     cancelProjectAutosave();
     suppressNextAutosaveRef.current = true;
     pendingResumeOperationIdRef.current = resumeOperationId;
+    pendingAutoPipelineRef.current = null;
 
     setVideo(hydratedVideo);
     setVideoUrl(apiUrl(hydratedVideo?.video_url));
@@ -264,6 +300,10 @@ export default function App({ recentProjectsOverride = null } = {}) {
     setTextAdOpacity(mapped.textAdOpacity);
     setVideoBannerEnabled(mapped.videoBannerEnabled);
     setVideoBannerHeight(mapped.videoBannerHeight);
+    setStreamerLayoutEnabled(mapped.streamerLayoutEnabled);
+    setWebcamRegion(mapped.webcamRegion);
+    setGameplayRegion(mapped.gameplayRegion);
+    setWebcamHeightRatio(mapped.webcamHeightRatio);
     setEditingIdx(null);
     setPlayerTime(0);
     setPlayerSeekTo(null);
@@ -312,6 +352,11 @@ export default function App({ recentProjectsOverride = null } = {}) {
             ? { ...item, transcription: snapshot, has_transcript: false }
             : item
         )));
+      },
+      receiveDelete: (projectId) => {
+        setRecentProjects((projects) => projects.filter((item) => item.project_id !== projectId));
+        setProjectDiagnostics((diagnostics) => diagnostics.filter((item) => item.project_id !== projectId));
+        if (selectedVideoIdRef.current === projectId) handleResetVideo();
       },
       setPendingAction: setProjectPendingAction,
       setError: setProjectError,
@@ -389,12 +434,11 @@ export default function App({ recentProjectsOverride = null } = {}) {
 
   useEffect(() => {
     if (!video) {
-      sessionStorage.removeItem(SESSION_KEY);
+      clearSession(window.sessionStorage);
       return;
     }
 
-    try {
-      sessionStorage.setItem(SESSION_KEY, JSON.stringify({
+    saveSession(window.sessionStorage, {
         projectId: currentProjectId,
         video,
         subtitleContext,
@@ -404,16 +448,21 @@ export default function App({ recentProjectsOverride = null } = {}) {
         clipResults,
         exportPadding,
         aspectRatio,
+        burnSubtitles,
+        insertAd,
         textAdEnabled,
         textAdText,
         textAdPosition,
         textAdInterval,
         textAdOpacity,
-      }));
-    } catch {
-      // Session persistence is optional; the active editor must keep working.
-    }
-  }, [currentProjectId, video, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity]);
+        videoBannerEnabled,
+        videoBannerHeight,
+        streamerLayoutEnabled,
+        webcamRegion,
+        gameplayRegion,
+        webcamHeightRatio,
+      });
+  }, [currentProjectId, video, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, burnSubtitles, insertAd, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity, videoBannerEnabled, videoBannerHeight, streamerLayoutEnabled, webcamRegion, gameplayRegion, webcamHeightRatio]);
 
   useEffect(() => {
     if (!serverOnline) {
@@ -445,10 +494,14 @@ export default function App({ recentProjectsOverride = null } = {}) {
         textAdOpacity,
         videoBannerEnabled,
         videoBannerHeight,
+        streamerLayoutEnabled,
+        webcamRegion,
+        gameplayRegion,
+        webcamHeightRatio,
       },
     });
     return () => autosaveSchedulerRef.current?.cancel();
-  }, [currentProjectId, projectLifecycle, serverOnline, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, burnSubtitles, insertAd, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity, videoBannerEnabled, videoBannerHeight]);
+  }, [currentProjectId, projectLifecycle, serverOnline, subtitleContext, subtitleNotice, segments, selected, clipResults, exportPadding, aspectRatio, burnSubtitles, insertAd, textAdEnabled, textAdText, textAdPosition, textAdInterval, textAdOpacity, videoBannerEnabled, videoBannerHeight, streamerLayoutEnabled, webcamRegion, gameplayRegion, webcamHeightRatio]);
 
   useEffect(() => () => {
     projectLifecycle.dispose();
@@ -551,7 +604,15 @@ export default function App({ recentProjectsOverride = null } = {}) {
     return projectLifecycle.restartProject(projectId);
   };
 
+  const handleDeleteProject = (project) => {
+    const projectId = project?.project_id;
+    if (!projectId) return Promise.resolve(null);
+    setProjectError('');
+    return projectLifecycle.deleteProject(projectId);
+  };
+
   const handleVideoReady = (videoData, localFileUrl = null) => {
+    const autoTranscriptionRequest = videoData.auto_transcription_request || null;
     restoreCandidateRef.current = null;
     projectLifecycle.cancelAll();
     pendingResumeOperationIdRef.current = null;
@@ -566,6 +627,21 @@ export default function App({ recentProjectsOverride = null } = {}) {
     setClipResults([]);
     setTranscript(videoData.transcript || null);
     setSubtitleContext(null);
+    pendingAutoPipelineRef.current = autoTranscriptionRequest
+      ? {
+          ...autoTranscriptionRequest,
+          videoId: videoData.video_id,
+          stage: 'queued',
+        }
+      : null;
+    if (autoTranscriptionRequest) {
+      setBurnSubtitles(true);
+      setAspectRatio(autoTranscriptionRequest.aspect_ratio || '9:16');
+    }
+    setStreamerLayoutEnabled(false);
+    setWebcamRegion(null);
+    setGameplayRegion(null);
+    setWebcamHeightRatio(0.35);
 
     const tInfo = videoData.transcript_info || {};
     if (tInfo.has_transcript || videoData.transcript?.has_transcript) {
@@ -577,6 +653,9 @@ export default function App({ recentProjectsOverride = null } = {}) {
       setSubtitleNotice('У видео нет субтитров, речь распознана локально.');
     } else {
       setSubtitleNotice('');
+    }
+    if (autoTranscriptionRequest) {
+      setSubtitleNotice('Видео загружено. Whisper запустится с возможностью паузы и остановки.');
     }
 
     if (localFileUrl) {
@@ -617,6 +696,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
     restoreCandidateRef.current = null;
     projectLifecycle.cancelAll();
     pendingResumeOperationIdRef.current = null;
+    pendingAutoPipelineRef.current = null;
     setCurrentProjectId(null);
     setHydratedOperation(null);
     setProjectPendingAction(null);
@@ -628,8 +708,20 @@ export default function App({ recentProjectsOverride = null } = {}) {
     setTranscript(null);
     setSubtitleContext(null);
     setSubtitleNotice('');
+    setStreamerLayoutEnabled(false);
+    setWebcamRegion(null);
+    setGameplayRegion(null);
+    setWebcamHeightRatio(0.35);
     clearSession(window.sessionStorage);
     setRecentProjectsRevision((revision) => revision + 1);
+  };
+
+  const handleStreamerLayoutEnabledChange = (nextEnabled) => {
+    setStreamerLayoutEnabled(nextEnabled);
+    if (nextEnabled) {
+      setWebcamRegion((current) => current || DEFAULT_WEBCAM_REGION);
+      setGameplayRegion((current) => current || DEFAULT_GAMEPLAY_REGION);
+    }
   };
 
   // ── Transcribe (Whisper) ───────────────────────────────────────────────────
@@ -679,7 +771,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
 
   // ── Analyze (Vizard ИИ-поиск историй или нарезка на равные части) ───────────
   const handleAnalyze = async (options = {}) => {
-    if (!video || importingSubtitles || transcribing) return;
+    if (!video || importingSubtitles || (transcribing && !options.transcriptOverride)) return;
+    const activeTranscript = options.transcriptOverride || transcript;
     setAnalyzing(true);
     setSegments([]);
     setSelected(new Set());
@@ -687,7 +780,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
 
     const isEqualMode = options.mode === 'equal_chunks';
     const chunkMinutes = options.chunk_minutes || 4.0;
-    const needsWhisper = !isEqualMode && !transcript?.has_transcript;
+    const needsWhisper = !isEqualMode && !activeTranscript?.has_transcript;
 
     setProgress({
       pct: needsWhisper ? 5 : 10,
@@ -719,7 +812,11 @@ export default function App({ recentProjectsOverride = null } = {}) {
         }),
       });
       const data = await readApiResponse(r);
-      const segs = data.segments || [];
+      const segmentLimit = Number(options.maxClips);
+      const segs = (data.segments || []).slice(
+        0,
+        Number.isFinite(segmentLimit) && segmentLimit > 0 ? segmentLimit : undefined,
+      );
       setSegments(segs);
       setSelected(new Set(segs.map((_, i) => i)));
 
@@ -735,9 +832,20 @@ export default function App({ recentProjectsOverride = null } = {}) {
             segments: segs.map((segment, index) => serializeExportSegment(segment, index)),
             mode: 'separate',
             padding: exportPadding,
-            aspect_ratio: aspectRatio,
+            aspect_ratio: effectiveAspectRatio,
             burn_subtitles: burnSubtitles,
             insert_ad: insertAd,
+            text_ad_enabled: textAdEnabled,
+            text_ad_text: textAdText,
+            text_ad_position: textAdPosition,
+            text_ad_interval: textAdInterval,
+            text_ad_opacity: textAdOpacity,
+            video_banner_enabled: videoBannerEnabled && hasVideoBanner,
+            video_banner_height: videoBannerHeight,
+            streamer_layout_enabled: streamerLayoutEnabled,
+            webcam_region: webcamRegion,
+            gameplay_region: gameplayRegion,
+            webcam_height_ratio: webcamHeightRatio,
           }),
         });
         const exportData = await readApiResponse(exportResponse);
@@ -754,6 +862,16 @@ export default function App({ recentProjectsOverride = null } = {}) {
       setAnalyzing(false);
       setExporting(false);
     }
+  };
+
+  continueAutoPipelineRef.current = (pending, readyTranscript) => {
+    setBurnSubtitles(true);
+    setAspectRatio(pending.aspect_ratio || '9:16');
+    handleAnalyze({
+      mode: 'transcript',
+      maxClips: pending.max_clips,
+      transcriptOverride: readyTranscript,
+    });
   };
 
   // ── Precise manual cut from selected transcript words ──────────────────────
@@ -801,8 +919,9 @@ export default function App({ recentProjectsOverride = null } = {}) {
   // ── Download single clip ───────────────────────────────────────────────────
   const handleDownloadSingleIndex = async (index, currentSegs = segments, padding = exportPadding) => {
     const seg = currentSegs[index];
-    if (!seg || !video) return;
+    if (!seg || !video || exportInFlightRef.current) return;
 
+    exportInFlightRef.current = true;
     setExporting(true);
     setProgress({ pct: 0, msg: `Нарезаю клип «${seg.label}»...` });
 
@@ -815,9 +934,21 @@ export default function App({ recentProjectsOverride = null } = {}) {
           segments: [serializeExportSegment(seg, index)],
           mode: 'separate',
           padding,
-          aspect_ratio: aspectRatio,
+          aspect_ratio: effectiveAspectRatio,
           burn_subtitles: burnSubtitles,
-          insert_ad: insertAd,        }),
+          insert_ad: insertAd,
+          text_ad_enabled: textAdEnabled,
+          text_ad_text: textAdText,
+          text_ad_position: textAdPosition,
+          text_ad_interval: textAdInterval,
+          text_ad_opacity: textAdOpacity,
+          video_banner_enabled: videoBannerEnabled && hasVideoBanner,
+          video_banner_height: videoBannerHeight,
+          streamer_layout_enabled: streamerLayoutEnabled,
+          webcam_region: webcamRegion,
+          gameplay_region: gameplayRegion,
+          webcam_height_ratio: webcamHeightRatio,
+        }),
       });
       const data = await readApiResponse(r);
       const clips = data.clips || [];
@@ -829,6 +960,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
     } catch (err) {
       alert('Ошибка экспорта клипа: ' + err.message);
     } finally {
+      exportInFlightRef.current = false;
       setExporting(false);
     }
   };
@@ -843,7 +975,8 @@ export default function App({ recentProjectsOverride = null } = {}) {
 
   // ── Batch Export ───────────────────────────────────────────────────────────
   const handleExport = async (mode) => {
-    if (!video || selected.size === 0) return;
+    if (!video || selected.size === 0 || exportInFlightRef.current) return;
+    exportInFlightRef.current = true;
     setExporting(true);
     setClipResults([]);
     setProgress({ pct: 0, msg: 'Нарезка клипов...' });
@@ -862,25 +995,48 @@ export default function App({ recentProjectsOverride = null } = {}) {
           segments: segsToExport,
           mode,
           padding: exportPadding,
-          aspect_ratio: aspectRatio,
+          aspect_ratio: effectiveAspectRatio,
           burn_subtitles: burnSubtitles,
-          insert_ad: insertAd,        }),
+          insert_ad: insertAd,
+          text_ad_enabled: textAdEnabled,
+          text_ad_text: textAdText,
+          text_ad_position: textAdPosition,
+          text_ad_interval: textAdInterval,
+          text_ad_opacity: textAdOpacity,
+          video_banner_enabled: videoBannerEnabled && hasVideoBanner,
+          video_banner_height: videoBannerHeight,
+          streamer_layout_enabled: streamerLayoutEnabled,
+          webcam_region: webcamRegion,
+          gameplay_region: gameplayRegion,
+          webcam_height_ratio: webcamHeightRatio,
+        }),
       });
       const data = await readApiResponse(r);
       setClipResults(data.clips || []);
     } catch (err) {
       alert('Ошибка экспорта: ' + err.message);
     } finally {
+      exportInFlightRef.current = false;
       setExporting(false);
     }
   };
+
+  const workflowStep = clipResults.length > 0
+    ? 3
+    : segments.length > 0
+      ? 2
+      : transcript?.has_transcript
+        ? 1
+        : 0;
+
+  const workflowStages = ['Исходник', 'Расшифровка', 'Монтаж', 'Экспорт'];
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="app-layout">
       <Header online={serverOnline} onSettings={() => setShowSettings(true)} />
 
-      <main className="app-main" style={{ paddingTop: 32 }}>
+      <main className="app-main">
 
         {projectError && (
           <div className="glass-card p-24" role="alert" style={{ marginBottom: 20 }}>
@@ -891,6 +1047,29 @@ export default function App({ recentProjectsOverride = null } = {}) {
         {/* ── Tabs for Input ────────────────────────────────────────────── */}
         {(!video || hasRecentProjectsOverride) && (
           <section style={{ marginBottom: 28 }}>
+            <div className="studio-overview">
+              <div className="studio-overview-copy">
+                <h1>Аркаим Clip Studio</h1>
+                <p>
+                  Локальная студия для расшифровки, монтажа и экспорта вертикальных роликов.
+                  Видео и сохранённый прогресс остаются на этом устройстве.
+                </p>
+              </div>
+              <div className="studio-overview-meta" aria-label="Состояние локальной системы">
+                <div className="studio-shield" aria-hidden="true">A</div>
+                <div>
+                  <strong>{serverOnline ? 'Локальный контур активен' : 'Backend недоступен'}</strong>
+                  <span>{serverOnline ? 'Можно начинать новый проект' : 'Запустите backend и обновите страницу'}</span>
+                </div>
+              </div>
+              <div className="workflow-rail" aria-label="Этапы обработки">
+                {workflowStages.map((stage, index) => (
+                  <span className={`workflow-stage ${index <= workflowStep ? 'is-active' : ''}`} key={stage}>
+                    {stage}
+                  </span>
+                ))}
+              </div>
+            </div>
 
             {projectDiagnostics.map((diagnostic) => (
               <div
@@ -910,23 +1089,24 @@ export default function App({ recentProjectsOverride = null } = {}) {
                 onOpen={(project) => hydrateRecentProject(project)}
                 onResume={(project) => hydrateRecentProject(project, { resume: true })}
                 onRestart={handleRestartProject}
+                onDelete={handleDeleteProject}
               />
             )}
 
-            <div style={{ display: 'flex', gap: 10, marginBottom: 16 }}>
+            <div className="input-mode-tabs">
               <button
                 id="btn-tab-url"
                 className={`btn ${inputTab === 'url' ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => setInputTab('url')}
               >
-                🔗 YouTube / URL ссылка
+                <span aria-hidden="true">⌁</span> YouTube / URL ссылка
               </button>
               <button
                 id="btn-tab-file"
                 className={`btn ${inputTab === 'file' ? 'btn-primary' : 'btn-secondary'}`}
                 onClick={() => setInputTab('file')}
               >
-                📁 Видео с ПК
+                <span aria-hidden="true">＋</span> Видео с устройства
               </button>
             </div>
 
@@ -941,6 +1121,19 @@ export default function App({ recentProjectsOverride = null } = {}) {
         {/* If video loaded: Header bar */}
         {video && (
           <section style={{ marginBottom: 24 }}>
+            <div className="project-stage-bar">
+              <div>
+                <strong>{video.title || video.filename || 'Текущий проект'}</strong>
+                <span>Проект сохраняется локально</span>
+              </div>
+              <div className="workflow-rail" aria-label="Текущий этап обработки">
+                {workflowStages.map((stage, index) => (
+                  <span className={`workflow-stage ${index <= workflowStep ? 'is-active' : ''}`} key={stage}>
+                    {stage}
+                  </span>
+                ))}
+              </div>
+            </div>
             <VideoUploader onVideoSelect={handleFileUpload} onResetVideo={handleResetVideo} currentVideo={video} />
             <input
               ref={subtitleInputRef}
@@ -971,10 +1164,23 @@ export default function App({ recentProjectsOverride = null } = {}) {
                 />
               </div>
 
+              <StreamerLayoutEditor
+                src={videoUrl}
+                currentTime={playerTime}
+                enabled={streamerLayoutEnabled}
+                onEnabledChange={handleStreamerLayoutEnabledChange}
+                webcamRegion={webcamRegion}
+                onWebcamRegionChange={setWebcamRegion}
+                gameplayRegion={gameplayRegion}
+                onGameplayRegionChange={setGameplayRegion}
+                webcamHeightRatio={webcamHeightRatio}
+                onWebcamHeightRatioChange={setWebcamHeightRatio}
+              />
+
               {/* Prompt Search */}
               <div className="glass-card p-24">
                 <div className="section-title">
-                  <div className="section-title-icon">🧠</div>
+                  <div className="section-title-icon" aria-hidden="true" />
                   ИИ-монтаж лучших моментов
                 </div>
                 <PromptSelector
@@ -988,7 +1194,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
                 />
                 {subtitleNotice && (
                   <div className="subtitle-upload-notice" role="status">
-                    ✓ {subtitleNotice}
+                    {subtitleNotice}
                   </div>
                 )}
               </div>
@@ -1007,7 +1213,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
                 />
               ) : (
                 <div className="glass-card p-24" style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center', minHeight: 300 }}>
-                  <div style={{ fontSize: 48, marginBottom: 12 }}>🎙️</div>
+                  <div className="transcript-empty-mark" aria-hidden="true">W</div>
                   <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
                     Транскрипция речи (Whisper)
                   </h3>
@@ -1021,7 +1227,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
                       onClick={() => subtitleInputRef.current?.click()}
                       disabled={importingSubtitles}
                     >
-                      {importingSubtitles ? <><div className="spinner" /> Импорт...</> : <>📄 Загрузить SRT</>}
+                      {importingSubtitles ? <><div className="spinner" /> Импорт...</> : <>Загрузить SRT</>}
                     </button>
                     <button
                       id="btn-start-transcribe"
@@ -1029,7 +1235,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
                       onClick={handleTranscribe}
                       disabled={transcribing}
                     >
-                      {transcribing ? <><div className="spinner" /> Распознавание...</> : <>🎙️ Запустить Whisper</>}
+                      {transcribing ? <><div className="spinner" /> Распознавание...</> : <>Запустить Whisper</>}
                     </button>
                   </div>
                 </div>
@@ -1054,18 +1260,18 @@ export default function App({ recentProjectsOverride = null } = {}) {
             <div className="progress-pct">{Math.min(progress.pct, 100)}%</div>
             <div className="progress-overlay-title">
               {progress.step === 'downloading'
-                ? '⬇️ Скачиваю видео...'
+                ? 'Скачиваю видео...'
                 : progress.step === 'transcribing'
-                  ? '🎙️ Whisper распознаёт речь...'
+                  ? 'Whisper распознаёт речь...'
                   : progress.step === 'importing' || importingSubtitles
-                    ? '📄 Загружаю SRT...'
+                    ? 'Загружаю SRT...'
                     : progress.step === 'exporting' || exporting
-                      ? '✂️ Нарезка клипов...'
+                      ? 'Нарезка клипов...'
                       : progress.step === 'analyzing'
-                        ? '🧠 ИИ ищет истории...'
+                        ? 'ИИ ищет истории...'
                         : autoProcessing
-                          ? '⚡ Готовлю клипы...'
-                          : '🧠 ИИ ищет истории...'}
+                          ? 'Готовлю клипы...'
+                          : 'ИИ ищет истории...'}
             </div>
             <p className="progress-overlay-msg">{progress.msg}</p>
             {progress.step === 'transcribing' && (
@@ -1081,7 +1287,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
         {segments.length > 0 && (
           <section style={{ marginBottom: 28 }}>
             <div className="section-title" style={{ marginBottom: 20 }}>
-              <div className="section-title-icon">⚡</div>
+              <div className="section-title-icon" aria-hidden="true" />
               Найденные клипы для Shorts ({segments.length})
             </div>
             <HighlightList
@@ -1095,6 +1301,7 @@ export default function App({ recentProjectsOverride = null } = {}) {
               onPlayAt={(start) => setPlayerSeekTo(start)}
               onEditSegment={(i) => setEditingIdx(i)}
               onDownloadSingle={handleDownloadSingleIndex}
+              exporting={exporting}
             />
           </section>
         )}
@@ -1109,8 +1316,9 @@ export default function App({ recentProjectsOverride = null } = {}) {
               clipResults={clipResults}
               padding={exportPadding}
               onPaddingChange={setExportPadding}
-              aspectRatio={aspectRatio}
-              onAspectRatioChange={setAspectRatio}
+              aspectRatio={effectiveAspectRatio}
+              onAspectRatioChange={(value) => setAspectRatio(streamerLayoutEnabled ? '9:16' : value)}
+              aspectRatioLocked={streamerLayoutEnabled}
               burnSubtitles={burnSubtitles}
               onBurnSubtitlesChange={setBurnSubtitles}
               insertAd={insertAd}

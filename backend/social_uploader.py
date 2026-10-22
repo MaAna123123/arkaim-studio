@@ -8,6 +8,7 @@ Instagram / TikTok: заглушки с инструкциями по подкл
 import os
 import json
 import logging
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,7 @@ class YouTubeUploader:
 
     def __init__(self):
         self._credentials = None
+        self._oauth_state = None
 
     @property
     def is_configured(self) -> bool:
@@ -55,19 +57,25 @@ class YouTubeUploader:
                 scopes=self.SCOPES,
                 redirect_uri="http://localhost:8000/api/social/youtube/callback",
             )
-            auth_url, _ = flow.authorization_url(
+            auth_url, state = flow.authorization_url(
                 access_type="offline",
                 include_granted_scopes="true",
                 prompt="consent",
             )
+            self._oauth_state = state
             return auth_url
         except Exception as e:
             logger.error(f"YouTube OAuth URL error: {e}")
             return None
 
-    def handle_callback(self, code: str) -> bool:
+    def handle_callback(self, code: str, state: str) -> bool:
         """Exchange authorization code for credentials and save token."""
-        if not self.is_configured:
+        if (
+            not self.is_configured
+            or not self._oauth_state
+            or not state
+            or not secrets.compare_digest(self._oauth_state, state)
+        ):
             return False
         try:
             from google_auth_oauthlib.flow import InstalledAppFlow
@@ -81,6 +89,7 @@ class YouTubeUploader:
             with open(self.TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
             self._credentials = creds
+            self._oauth_state = None
             return True
         except Exception as e:
             logger.error(f"YouTube OAuth callback error: {e}")

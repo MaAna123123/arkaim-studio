@@ -88,7 +88,7 @@ function getActiveSubtitle(transcript, currentTime) {
   return active.map(w => w.word).join(' ').trim();
 }
 
-export default function VideoPlayer({ src, segments, duration, onTimeUpdate, seekTo, onSeekDone, transcript }) {
+export default function VideoPlayer({ src, segments, duration, onTimeUpdate, seekTo, onSeekDone, transcript, showSubtitles = true }) {
   const videoRef = useRef(null);
   const seekBarRef = useRef(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -147,7 +147,7 @@ export default function VideoPlayer({ src, segments, duration, onTimeUpdate, see
           />
 
           {/* Compact Clean Subtitle Overlay at Bottom */}
-          {activeSub && (
+          {showSubtitles && activeSub && (
             <div style={{
               position: 'absolute',
               bottom: '8%',
@@ -193,8 +193,8 @@ export default function VideoPlayer({ src, segments, duration, onTimeUpdate, see
 
             {/* Controls row */}
             <div className="player-controls-row">
-              <button id="btn-player-play" className="btn btn-ghost btn-sm" style={{ fontSize: 18, padding: '4px 10px' }} onClick={togglePlay}>
-                {paused ? '▶' : '⏸'}
+              <button id="btn-player-play" className="btn btn-ghost btn-sm" onClick={togglePlay}>
+                {paused ? 'Пуск' : 'Пауза'}
               </button>
               <span className="player-time">{fmt(currentTime)} / {fmt(dur)}</span>
               <span style={{ flex: 1 }} />
@@ -205,7 +205,7 @@ export default function VideoPlayer({ src, segments, duration, onTimeUpdate, see
                 style={{ width: 80, accentColor: 'var(--accent-primary)' }}
                 onChange={(e) => { const v = +e.target.value; setVol(v); if (videoRef.current) videoRef.current.volume = v; }}
               />
-              🔊
+              <span className="player-volume-label">Звук</span>
             </div>
           </div>
         </>

@@ -258,7 +258,7 @@ def download(
                 progress_cb(f"Скачиваю видео: {mb_done:.1f} / {mb_total:.1f} МБ", pct)
 
     opts = {
-        **_get_ydl_opts(quiet=True),
+        **_get_ydl_opts(quiet=True, url=url),
         "format": fmt,
         "outtmpl": out_template,
         "progress_hooks": [progress_hook],
@@ -470,17 +470,26 @@ def _parse_vtt_or_xml(payload: bytes, ext: str) -> tuple[list[dict], list[dict]]
         segments: list[dict] = []
         flat_words: list[dict] = []
         pattern = re.compile(
-            r'<(?:text|p)[^>]*(?:start|begin)="([\d.:]+)"[^>]*(?:dur|end)="([\d.:]+)"[^>]*>(.*?)</(?:text|p)>',
+            r'<(?P<tag>text|p)\b(?P<attrs>[^>]*)>(?P<body>.*?)</(?P=tag)>',
             re.DOTALL,
         )
+        time_attr_pattern = re.compile(r'\b(start|begin|dur|end)="([\d.:]+)"')
         for match in pattern.finditer(text):
+            time_attrs = dict(time_attr_pattern.findall(match.group("attrs")))
+            start_raw = time_attrs.get("start") or time_attrs.get("begin")
+            if not start_raw:
+                continue
             try:
-                start = _parse_flexible_time(match.group(1))
-                second = _parse_flexible_time(match.group(2))
+                start = _parse_flexible_time(start_raw)
+                if "dur" in time_attrs:
+                    end = start + _parse_flexible_time(time_attrs["dur"])
+                elif "end" in time_attrs:
+                    end = _parse_flexible_time(time_attrs["end"])
+                else:
+                    continue
             except ValueError:
                 continue
-            end = start + second if second < start else second
-            body = re.sub(r"<[^>]+>", "", match.group(3))
+            body = re.sub(r"<[^>]+>", "", match.group("body"))
             body = _unescape(body).strip()
             body = re.sub(r"\s+", " ", body)
             if not body or end <= start:

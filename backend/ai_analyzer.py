@@ -553,10 +553,9 @@ class VideoAIAnalyzer:
             if on_progress:
                 await on_progress(msg, pct)
 
-        if self.api_key:
+        if self.provider == "gemini" and self.api_key:
             return await self._analyze_gemini(video_path, prompt, _progress)
-        else:
-            return await self._analyze_local(video_path, prompt, _progress)
+        return await self._analyze_local(video_path, prompt, _progress)
 
     async def _analyze_gemini(self, video_path: str, prompt: str, progress) -> list[dict]:
         try:
@@ -660,12 +659,12 @@ class VideoAIAnalyzer:
         )
         times = []
         for line in result.stderr.split("\n"):
-            for part in line.split():
-                if part.startswith("pts_time:"):
-                    try:
-                        times.append(float(part.split(":")[1]))
-                    except Exception:
-                        pass
+            match = re.search(
+                r"(?:lavfi\.scd\.time|pts_time):\s*([0-9]+(?:\.[0-9]+)?)",
+                line,
+            )
+            if match:
+                times.append(float(match.group(1)))
         return times
 
     def _detect_audio_peaks(self, video_path: str, duration: float) -> list[float]:

@@ -120,7 +120,7 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
   return (
     <div className="modal-overlay composition-modal-overlay" onMouseDown={(event) => event.target === event.currentTarget && onCancel?.()}>
       <div className="modal-box clip-composer-modal" role="dialog" aria-modal="true" aria-label={`Редактор клипа ${index + 1}`}>
-        <div className="segment-editor-header"><div><div className="arkaim-eyebrow">КОМПОЗИТОР КЛИПА</div><h3>Редактирование момента #{index + 1}</h3></div><button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>✕</button></div>
+        <div className="segment-editor-header"><div><div className="arkaim-eyebrow">Композитор клипа</div><h3>Редактирование момента #{index + 1}</h3></div><button type="button" className="btn btn-ghost btn-sm" aria-label="Закрыть" onClick={onCancel}>×</button></div>
         <div className="clip-composer-grid">
           <div className="clip-composer-preview-column">
             <CompositionCanvas sourceUrl={sourceUrl} previewTime={composition.source_start} composition={composition} selectedLayer={selectedLayer} bannerMedia={bannerMatches ? bannerMedia : null} adMedia={adMatches ? adMedia : null} sourceWidth={sourceWidth} sourceHeight={sourceHeight} onCompositionChange={setComposition} />
@@ -151,7 +151,7 @@ export default function ClipComposer({ segment, index = 0, sourceDuration = 0, s
           </div>
         </div>
         {contextWords.length > 0 && <div className="segment-editor-text-block"><div className="segment-editor-text-head"><strong>Точный выбор по словам</strong><small>Выделите мышкой фразу — границы клипа обновятся</small></div><div ref={wordsRef} className="segment-editor-words" onMouseUp={captureTranscriptRange}>{contextWords.map((word, wordIndex) => <span key={`${word.start}-${wordIndex}`} data-composer-word={wordIndex} className={word.end >= composition.source_start && word.start <= composition.source_end ? 'included' : ''}>{word.word}{' '}</span>)}</div></div>}
-        <div className="segment-editor-footer"><div><button type="button" className="btn btn-ghost" onClick={reset}>Сбросить поля</button><button id="btn-reset-legacy-composition" type="button" className="btn btn-ghost" onClick={resetToLegacy}>Обычный экспорт без компоновки</button></div><div><button type="button" className="btn btn-secondary" onClick={onCancel}>Отмена</button><button id="btn-save-composition" type="button" className="btn btn-primary" onClick={save}>✓ Сохранить клип</button></div></div>
+        <div className="segment-editor-footer"><div><button type="button" className="btn btn-ghost" onClick={reset}>Сбросить поля</button><button id="btn-reset-legacy-composition" type="button" className="btn btn-ghost" onClick={resetToLegacy}>Обычный экспорт без компоновки</button></div><div><button type="button" className="btn btn-secondary" onClick={onCancel}>Отмена</button><button id="btn-save-composition" type="button" className="btn btn-primary" onClick={save}>Сохранить клип</button></div></div>
       </div>
     </div>
   );

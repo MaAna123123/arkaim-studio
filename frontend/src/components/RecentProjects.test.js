@@ -110,7 +110,7 @@ test('a missing-source card exposes details only and preserves project identity'
   const details = buttonWithText(tree, 'Детали проекта');
   assert.equal(details.type, 'button');
   assert.equal(details.props.type, 'button');
-  assert.equal(buttons(tree).length, 1);
+  assert.equal(buttons(tree).length, 2);
   details.props.onClick();
   assert.deepEqual(opened, [project]);
 });
@@ -130,6 +130,30 @@ test('restart calls its handler only after native confirmation', () => {
     globalThis.window = { confirm: () => true };
     restart.props.onClick();
     assert.deepEqual(restarted, [project]);
+  } finally {
+    globalThis.window = previousWindow;
+  }
+});
+
+test('delete requires explicit confirmation and passes only the selected project', () => {
+  const first = recoverableProject('first');
+  const second = recoverableProject('second');
+  const deleted = [];
+  const previousWindow = globalThis.window;
+  const tree = RecentProjects({
+    projects: [first, second],
+    onDelete: (value) => deleted.push(value),
+  });
+  const [firstCard, secondCard] = descendants(tree, (child) => child.type === 'article');
+
+  try {
+    globalThis.window = { confirm: () => false };
+    buttonWithText(firstCard, 'Удалить').props.onClick();
+    assert.deepEqual(deleted, []);
+
+    globalThis.window = { confirm: () => true };
+    buttonWithText(secondCard, 'Удалить').props.onClick();
+    assert.deepEqual(deleted, [second]);
   } finally {
     globalThis.window = previousWindow;
   }

@@ -511,6 +511,50 @@ class TranscriptionServiceTests(unittest.IsolatedAsyncioTestCase):
             transcriber.returned_result,
         )
 
+    async def test_stopped_worker_can_be_fully_retired_before_project_deletion(self):
+        transcriber = StopReturnTranscriber()
+        service = self.make_service(transcriber)
+        operation = service.start(
+            "video-1",
+            "video.mp4",
+            None,
+            self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        await self.assert_event_set(transcriber.started)
+
+        service.stop(operation["operation_id"])
+        await service.wait_for_terminal(operation["operation_id"])
+        await service.wait_for_idle(operation["operation_id"])
+        service.forget(operation["operation_id"])
+
+        self.assertIsNone(service.manager.get(operation["operation_id"]))
+        self.assertNotIn(operation["operation_id"], service._metadata)
+        self.assertNotIn(("transcription", "video-1"), service._video_operations)
+
+    async def test_project_deletion_claim_blocks_new_start_and_restart(self):
+        service = self.make_service(ControllableTranscriber())
+        service.begin_video_deletion("video-1")
+
+        with self.assertRaisesRegex(OperationConflictError, "deleted"):
+            service.start(
+                "video-1", "video.mp4", None, self.transcript_path,
+                asyncio.get_running_loop(),
+            )
+        with self.assertRaisesRegex(OperationConflictError, "deleted"):
+            service.restart_from_zero(
+                "video-1", "video.mp4", None, self.transcript_path,
+                asyncio.get_running_loop(),
+            )
+
+        service.abort_video_deletion("video-1")
+        operation = service.start(
+            "video-1", "video.mp4", None, self.transcript_path,
+            asyncio.get_running_loop(),
+        )
+        service.stop(operation["operation_id"])
+        await service.shutdown(timeout=0.5)
+
     async def test_graceful_shutdown_persists_returned_snapshot_newer_than_partial(self):
         transcriber = StopReturnTranscriber(emit_partial=True)
         service = self.make_service(transcriber)

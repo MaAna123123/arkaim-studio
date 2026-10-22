@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import uuid
 import asyncio
 import urllib.parse
@@ -14,9 +15,9 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, WebSocket, WebSock
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("videopril")
@@ -97,8 +98,9 @@ async def composition_validation_error(_request: Request, exc: RequestValidation
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[],
+    allow_origin_regex=r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?$",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -167,6 +169,8 @@ project_store = ProjectStore(
     legacy_transcripts_dir=TRANSCRIPTS_DIR,
 )
 active_connections: list[WebSocket] = []
+ad_upload_lock = asyncio.Lock()
+banner_upload_lock = asyncio.Lock()
 
 # ─────────────────────────────────────────────
 # WebSocket manager
@@ -379,6 +383,84 @@ async def patch_project(project_id: str, payload: dict):
     except (FileNotFoundError, OSError, json.JSONDecodeError,
             UnsupportedProjectSchemaError) as exc:
         raise _project_storage_error(exc) from exc
+
+
+def _delete_project_artifacts(project_id: str) -> None:
+    targets = (
+        (CLIPS_DIR, f"{project_id}_*"),
+        (THUMBS_DIR, f"{project_id}_*"),
+        (TRANSCRIPTS_DIR, f"{project_id}.*"),
+        (TEMP_DIR, f"{project_id}_*"),
+    )
+    for root, pattern in targets:
+        resolved_root = Path(root).resolve()
+        if not resolved_root.is_dir():
+            continue
+        for candidate in resolved_root.glob(pattern):
+            if candidate.is_symlink():
+                candidate.unlink(missing_ok=True)
+                continue
+            if getattr(candidate, "is_junction", lambda: False)():
+                candidate.rmdir()
+                continue
+            resolved_candidate = candidate.resolve()
+            resolved_candidate.relative_to(resolved_root)
+            if resolved_candidate.is_dir():
+                shutil.rmtree(resolved_candidate)
+            else:
+                resolved_candidate.unlink(missing_ok=True)
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str):
+    normalized_id = _normalize_project_id(project_id)
+    try:
+        project_store.source_status(normalized_id)
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+
+    try:
+        transcription_service.begin_video_deletion(normalized_id)
+    except OperationConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    project_removed = False
+    try:
+        operation = operation_manager.find_for_video(normalized_id, include_stopped=True)
+        if operation is not None:
+            operation_id = operation["operation_id"]
+            if operation["status"] in {"running", "paused"}:
+                transcription_service.stop(operation_id)
+                await asyncio.wait_for(
+                    transcription_service.wait_for_terminal(operation_id),
+                    timeout=10,
+                )
+            elif operation["status"] in {"queued", "stopped"}:
+                if operation["status"] == "queued":
+                    operation_manager.transition(operation_id, "cancelled")
+            await asyncio.wait_for(
+                transcription_service.wait_for_idle(operation_id),
+                timeout=10,
+            )
+            transcription_service.forget(operation_id)
+        _delete_project_artifacts(normalized_id)
+        project_store.delete_project(normalized_id)
+        project_removed = True
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Не удалось безопасно остановить активную транскрипцию",
+        ) from exc
+    except (KeyError, OperationConflictError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError,
+            UnsupportedProjectSchemaError) as exc:
+        raise _project_storage_error(exc) from exc
+    finally:
+        if not project_removed:
+            transcription_service.abort_video_deletion(normalized_id)
+    return {"deleted": True, "project_id": normalized_id}
 
 
 @app.post("/api/projects/{project_id}/transcription/restart")
@@ -819,10 +901,22 @@ async def youtube_auto(req: AutoPipelineRequest):
         )
         video_path = str(out_file)
 
-        # 3. Транскрипт: субтитры YouTube, иначе Whisper
-        transcript = await _resolve_transcript(
-            req.url, video_id, video_path, info, transcript, progress
-        )
+        # 3. Whisper нужен только когда пользователь явно выбрал субтитры.
+        # Новый frontend запускает отсутствующий Whisper через управляемую
+        # операцию, поэтому вариант без субтитров никогда не тратит на него время.
+        if req.burn_subtitles:
+            transcript = await _resolve_transcript(
+                req.url, video_id, video_path, info, transcript, progress
+            )
+        elif not transcript.get("has_transcript"):
+            transcript = {
+                "has_transcript": False,
+                "segments": [],
+                "words": [],
+                "paragraphs": [],
+                "full_text": "",
+                "duration": info.get("duration", 0),
+            }
         # 4. Превью для таймлайна
         meta = await asyncio.to_thread(processor.extract_metadata, video_path)
         thumbs = await asyncio.to_thread(
@@ -1147,6 +1241,10 @@ async def import_transcript(video_id: str = Form(...), file: UploadFile = File(.
 
 @app.get("/api/video/transcript/{video_id}")
 async def get_transcript(video_id: str):
+    try:
+        normalized_id = str(uuid.UUID(video_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Некорректный идентификатор видео") from exc
     data = _load_saved_transcript(video_id)
     if data is None:
         return {"has_transcript": False}
@@ -1291,6 +1389,10 @@ async def _export_segments(
     text_ad_opacity: float = 0.75,
     video_banner_enabled: bool = False,
     video_banner_height: int = 380,
+    streamer_layout_enabled: bool = False,
+    webcam_region=None,
+    gameplay_region=None,
+    webcam_height_ratio: float = 0.35,
     base_pct: int = 10,
     span_pct: int = 90,
 ) -> list[dict]:
@@ -1321,9 +1423,11 @@ async def _export_segments(
             video_path, segments, out_path, padding, aspect_ratio, burn_subtitles, words,
             text_ad_enabled, text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity,
             video_banner_enabled, banner_path or "", video_banner_height,
+            streamer_layout_enabled, webcam_region, gameplay_region, webcam_height_ratio,
             overlay_ad_path=ad_path or "",
             insert_ad_path=ad_path if insert_ad else "",
         )
+
         await broadcast({"type": "progress", "step": "exporting",
                          "pct": base_pct + span_pct, "msg": "Готово!"})
         return [{"url": f"/clips/{out_name}", "label": f"Highlights Reel ({aspect_ratio})"}]
@@ -1346,10 +1450,12 @@ async def _export_segments(
                     padding, aspect_ratio, "", burn_subtitles, words,
                     text_ad_enabled, text_ad_text, text_ad_position, text_ad_interval, text_ad_opacity,
                     video_banner_enabled, banner_path or "", video_banner_height,
+                    streamer_layout_enabled, webcam_region, gameplay_region, webcam_height_ratio,
                     composition=seg.get("composition"),
                     overlay_ad_path=ad_path or "",
                 )
         except Exception as exc:
+            # Один сбойный клип не должен ронять весь экспорт
             logger.warning(f"Клип {i + 1} не удалось нарезать: {exc}")
             return i, None
 
@@ -1398,6 +1504,7 @@ async def _export_segments(
         raise HTTPException(status_code=500, detail="Ни один клип не удалось нарезать. Проверьте, что FFmpeg установлен.")
 
     return results
+
 
 @app.post("/api/video/export")
 async def export_clips(req: ExportRequest):
@@ -1462,6 +1569,10 @@ async def export_clips(req: ExportRequest):
         text_ad_opacity=req.text_ad_opacity,
         video_banner_enabled=req.video_banner_enabled,
         video_banner_height=req.video_banner_height,
+        streamer_layout_enabled=req.streamer_layout_enabled,
+        webcam_region=req.webcam_region,
+        gameplay_region=req.gameplay_region,
+        webcam_height_ratio=req.webcam_height_ratio,
     )
     return {"clips": results}
 
@@ -1532,19 +1643,21 @@ async def upload_ad(file: UploadFile = File(...)):
     if ext not in {".mp4", ".mkv", ".mov", ".webm", ".avi"}:
         raise HTTPException(status_code=400, detail="Неподдерживаемый формат видео для рекламы")
 
-    # Remove any existing ad files
-    for existing in ADS_DIR.glob("current_ad.*"):
-        existing.unlink(missing_ok=True)
-
     ad_path = ADS_DIR / f"current_ad{ext}"
+    pending_path = ADS_DIR / f".pending_ad_{uuid.uuid4().hex}{ext}"
     try:
-        async with aiofiles.open(ad_path, "wb") as f:
+        async with aiofiles.open(pending_path, "wb") as f:
             while chunk := await file.read(1024 * 1024):
                 await f.write(chunk)
-        if ad_path.stat().st_size == 0:
+        if pending_path.stat().st_size == 0:
             raise ValueError("Загружен пустой файл")
 
-        meta = await asyncio.to_thread(processor.extract_metadata, str(ad_path))
+        meta = await asyncio.to_thread(processor.extract_metadata, str(pending_path))
+        async with ad_upload_lock:
+            os.replace(pending_path, ad_path)
+            for existing in ADS_DIR.glob("current_ad.*"):
+                if existing != ad_path:
+                    existing.unlink(missing_ok=True)
         return {
             "success": True,
             "filename": file.filename,
@@ -1556,7 +1669,7 @@ async def upload_ad(file: UploadFile = File(...)):
             "url": f"/ads/{ad_path.name}",
         }
     except Exception as exc:
-        ad_path.unlink(missing_ok=True)
+        pending_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Ошибка загрузки рекламы: {exc}") from exc
     finally:
         await file.close()
@@ -1612,18 +1725,21 @@ async def upload_banner(file: UploadFile = File(...)):
     if ext not in {".mp4", ".mkv", ".mov", ".webm", ".avi"}:
         raise HTTPException(status_code=400, detail="Неподдерживаемый формат видео для баннера")
 
-    for existing in BANNER_DIR.glob("current_banner.*"):
-        existing.unlink(missing_ok=True)
-
     banner_path = BANNER_DIR / f"current_banner{ext}"
+    pending_path = BANNER_DIR / f".pending_banner_{uuid.uuid4().hex}{ext}"
     try:
-        async with aiofiles.open(banner_path, "wb") as f:
+        async with aiofiles.open(pending_path, "wb") as f:
             while chunk := await file.read(1024 * 1024):
                 await f.write(chunk)
-        if banner_path.stat().st_size == 0:
+        if pending_path.stat().st_size == 0:
             raise ValueError("Загружен пустой файл")
 
-        meta = await asyncio.to_thread(processor.extract_metadata, str(banner_path))
+        meta = await asyncio.to_thread(processor.extract_metadata, str(pending_path))
+        async with banner_upload_lock:
+            os.replace(pending_path, banner_path)
+            for existing in BANNER_DIR.glob("current_banner.*"):
+                if existing != banner_path:
+                    existing.unlink(missing_ok=True)
         return {
             "success": True,
             "filename": file.filename,
@@ -1635,7 +1751,7 @@ async def upload_banner(file: UploadFile = File(...)):
             "url": f"/banners/{banner_path.name}",
         }
     except Exception as exc:
-        banner_path.unlink(missing_ok=True)
+        pending_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Ошибка загрузки баннера: {exc}") from exc
     finally:
         await file.close()
@@ -1724,13 +1840,15 @@ async def youtube_auth():
 
 
 @app.get("/api/social/youtube/callback")
-async def youtube_callback(code: str = ""):
+async def youtube_callback(code: str = "", state: str = ""):
     """Handle YouTube OAuth2 callback."""
     if not code:
         raise HTTPException(status_code=400, detail="Не получен authorization code")
-    success = youtube_uploader.handle_callback(code)
+    if not state:
+        raise HTTPException(status_code=400, detail="Не получен OAuth state")
+    success = youtube_uploader.handle_callback(code, state)
     if success:
-        return JSONResponse(content="""
+        return HTMLResponse(content="""
         <html><body style="background:#0a0e1a;color:#fff;font-family:Inter,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center">
         <div><h1>✅ YouTube подключён!</h1><p>Можете закрыть это окно и вернуться в приложение.</p></div>
         </body></html>

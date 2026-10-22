@@ -29,14 +29,14 @@ export default function PromptSelector({
           className={`btn btn-sm ${mode === 'ai' ? 'btn-primary' : 'btn-secondary'}`}
           onClick={() => setMode('ai')}
         >
-          🧠 ИИ-поиск моментов
+          ИИ-поиск моментов
         </button>
         <button
           type="button"
           className={`btn btn-sm ${mode === 'equal' ? 'btn-primary' : 'btn-secondary'}`}
           onClick={() => setMode('equal')}
         >
-          ⏱ Нарезка на равные части (сериалы)
+          Нарезка на равные части
         </button>
       </div>
 
@@ -76,7 +76,6 @@ export default function PromptSelector({
 
       {subtitleContext && (
         <div className={`subtitle-context-badge ${subtitleContext.kind === 'chapters' ? 'chapters' : 'full'}`}>
-          <span>{subtitleContext.kind === 'chapters' ? '🗺️' : '📄'}</span>
           <div>
             <strong>{subtitleContext.kind === 'chapters' ? 'Карта глав подключена' : 'Полный SRT подключён'}</strong>
             <small>{subtitleContext.filename}</small>
@@ -93,7 +92,7 @@ export default function PromptSelector({
           {preparingTranscript ? (
             <><div className="spinner" /> Готовлю выделяемый текст...</>
           ) : (
-            <>📝 Подготовить текст для ручной нарезки</>
+            <>Подготовить текст для ручной нарезки</>
           )}
         </button>
       )}
@@ -103,14 +102,14 @@ export default function PromptSelector({
         className="btn btn-primary btn-lg auto-highlight-button"
         onClick={handleRun}
         disabled={loading || preparingTranscript || disabled}
-        style={mode === 'equal' ? { background: 'linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%)' } : {}}
+        style={mode === 'equal' ? { background: 'var(--accent-primary)', color: 'var(--ink-inverse)' } : {}}
       >
         {loading ? (
           <><div className="spinner" /> Нарезаю на части...</>
         ) : mode === 'equal' ? (
-          <>✂️ Разбить всё видео по {chunkMinutes} мин</>
+          <>Разбить всё видео по {chunkMinutes} мин</>
         ) : (
-          <>✨ Найти и нарезать лучшие моменты</>
+          <>Найти и нарезать лучшие моменты</>
         )}
       </button>
     </div>

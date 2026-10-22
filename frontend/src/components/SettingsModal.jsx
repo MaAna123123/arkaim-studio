@@ -1,9 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 const PROVIDERS = [
   {
     id: 'gemini',
-    name: '🌌 Google Gemini',
+    name: 'Google Gemini',
     desc: 'Бесплатный тариф Gemini 2.0 Flash (очень быстрый)',
     defaultModel: 'gemini-2.0-flash',
     requiresKey: true,
@@ -11,7 +11,7 @@ const PROVIDERS = [
   },
   {
     id: 'deepseek',
-    name: '🐋 DeepSeek API',
+    name: 'DeepSeek API',
     desc: 'DeepSeek-V3 и DeepSeek-R1 (топовый анализ сюжета)',
     defaultModel: 'deepseek-chat',
     baseUrl: 'https://api.deepseek.com/v1',
@@ -20,7 +20,7 @@ const PROVIDERS = [
   },
   {
     id: 'openrouter',
-    name: '🆓 OpenRouter (Бесплатный Qwen & DeepSeek)',
+    name: 'OpenRouter (бесплатный Qwen и DeepSeek)',
     desc: '100% Бесплатные модели Qwen 2.5 72B и DeepSeek R1',
     defaultModel: 'qwen/qwen-2.5-72b-instruct:free',
     baseUrl: 'https://openrouter.ai/api/v1',
@@ -29,7 +29,7 @@ const PROVIDERS = [
   },
   {
     id: 'ollama',
-    name: '💻 Ollama (Локальный ИИ на ПК)',
+    name: 'Ollama (локальный ИИ)',
     desc: '100% Бесплатный ИИ прямо на вашей видеокарте/ПК (без интернета)',
     defaultModel: 'qwen2.5:7b',
     baseUrl: 'http://localhost:11434/v1',
@@ -38,6 +38,7 @@ const PROVIDERS = [
 ];
 
 export default function SettingsModal({ apiBase, onClose }) {
+  const dialogRef = useRef(null);
   const [provider, setProvider] = useState('gemini');
   const [apiKey, setApiKey] = useState('');
   const [maskedKey, setMaskedKey] = useState('');
@@ -62,6 +63,20 @@ export default function SettingsModal({ apiBase, onClose }) {
       })
       .catch(() => {});
   }, [apiBase]);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    const dialog = dialogRef.current;
+    dialog?.querySelector('button, input, select, textarea, a[href]')?.focus();
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      previousFocus?.focus?.();
+    };
+  }, [onClose]);
 
   const activeProviderObj = PROVIDERS.find((p) => p.id === provider) || PROVIDERS[0];
 
@@ -101,16 +116,23 @@ export default function SettingsModal({ apiBase, onClose }) {
 
   return (
     <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="modal-box" style={{ maxWidth: 580 }}>
+      <div
+        ref={dialogRef}
+        className="modal-box"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-dialog-title"
+        style={{ maxWidth: 580 }}
+      >
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 24 }}>
           <div>
-            <h2 style={{ fontSize: 20, fontWeight: 800 }}>⚙️ Настройки ИИ-нейросети</h2>
+            <h2 id="settings-dialog-title" style={{ fontSize: 20, fontWeight: 800 }}>Настройки ИИ</h2>
             <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 4 }}>
               Выберите провайдера для смыслового поиска историй
             </p>
           </div>
-          <button className="btn btn-ghost btn-sm" onClick={onClose}>✕</button>
+          <button className="btn btn-ghost btn-sm" aria-label="Закрыть" onClick={onClose}>×</button>
         </div>
 
         {/* Provider selector */}
@@ -199,12 +221,12 @@ export default function SettingsModal({ apiBase, onClose }) {
         {/* Save button */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-            {saved ? '✅ Настройки сохранены!' : ''}
+            {saved ? 'Настройки сохранены.' : ''}
           </span>
           <div style={{ display: 'flex', gap: 10 }}>
             <button className="btn btn-secondary" onClick={onClose}>Отмена</button>
             <button id="btn-settings-save" className={`btn ${saved ? 'btn-success' : 'btn-primary'}`} onClick={handleSave} disabled={saving}>
-              {saved ? '✓ Сохранено' : saving ? 'Сохраняю...' : 'Сохранить'}
+              {saved ? 'Сохранено' : saving ? 'Сохраняю...' : 'Сохранить'}
             </button>
           </div>
         </div>

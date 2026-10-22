@@ -54,6 +54,10 @@ export function buildProjectEditorPatch(editor = {}) {
     text_ad_opacity: editor.textAdOpacity,
     video_banner_enabled: editor.videoBannerEnabled,
     video_banner_height: editor.videoBannerHeight,
+    streamer_layout_enabled: editor.streamerLayoutEnabled,
+    webcam_region: editor.webcamRegion,
+    gameplay_region: editor.gameplayRegion,
+    webcam_height_ratio: editor.webcamHeightRatio,
   };
 }
 

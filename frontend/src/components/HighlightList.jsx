@@ -13,14 +13,14 @@ function scoreColor(score) {
 }
 
 function sourceBadge(source) {
-  if (source === 'transcript') return <span className="badge badge-purple">📝 ИИ по транскрипту</span>;
-  if (source === 'youtube_chapter') return <span className="badge badge-cyan">📑 YouTube глава</span>;
-  if (source === 'frames') return <span className="badge badge-yellow">🖼 ИИ по кадрам</span>;
-  if (source === 'manual') return <span className="badge badge-purple">✂️ Ручная нарезка</span>;
-  return <span className="badge badge-green">⚡ Локальный пик</span>;
+  if (source === 'transcript') return <span className="badge badge-purple">ИИ по транскрипту</span>;
+  if (source === 'youtube_chapter') return <span className="badge badge-cyan">YouTube глава</span>;
+  if (source === 'frames') return <span className="badge badge-yellow">ИИ по кадрам</span>;
+  if (source === 'manual') return <span className="badge badge-purple">Ручная нарезка</span>;
+  return <span className="badge badge-green">Локальный пик</span>;
 }
 
-export default function HighlightList({ segments, selected, onToggle, onPlayAt, onEditSegment, onDownloadSingle }) {
+export default function HighlightList({ segments, selected, onToggle, onPlayAt, onEditSegment, onDownloadSingle, exporting = false }) {
   const [expandedText, setExpandedText] = useState(new Set());
   if (!segments.length) return null;
 
@@ -43,7 +43,7 @@ export default function HighlightList({ segments, selected, onToggle, onPlayAt, 
                 className={`highlight-card-check ${isSelected ? 'checked' : ''}`}
                 onClick={(e) => { e.stopPropagation(); onToggle(i); }}
               >
-                {isSelected && <span style={{ color: '#fff', fontSize: 12 }}>✓</span>}
+                {isSelected && <span className="selection-mark" aria-hidden="true" />}
               </div>
 
               <div style={{ flex: 1, minWidth: 0 }}>
@@ -55,7 +55,7 @@ export default function HighlightList({ segments, selected, onToggle, onPlayAt, 
                 </div>
 
                 <div className="highlight-card-timecode">
-                  ⏱ {fmt(seg.start)} → {fmt(seg.end)} &nbsp;•&nbsp; {dur}с
+                  {fmt(seg.start)} → {fmt(seg.end)} &nbsp;•&nbsp; {dur}с
                 </div>
               </div>
             </div>
@@ -112,21 +112,22 @@ export default function HighlightList({ segments, selected, onToggle, onPlayAt, 
                 className="btn btn-ghost btn-sm"
                 onClick={(e) => { e.stopPropagation(); onPlayAt(seg.start); }}
               >
-                ▶ Смотреть
+                Смотреть
               </button>
               <button
                 id={`btn-edit-segment-${i}`}
                 className="btn btn-secondary btn-sm"
                 onClick={(e) => { e.stopPropagation(); onEditSegment(i); }}
               >
-                ✏️ Править
+                Править
               </button>
               <button
                 id={`btn-download-single-${i}`}
                 className="btn btn-primary btn-sm"
                 onClick={(e) => { e.stopPropagation(); onDownloadSingle(i); }}
+                disabled={exporting}
               >
-                ⬇ Скачать
+                Скачать
               </button>
               <button
                 id={`btn-toggle-segment-${i}`}
@@ -134,7 +135,7 @@ export default function HighlightList({ segments, selected, onToggle, onPlayAt, 
                 onClick={(e) => { e.stopPropagation(); onToggle(i); }}
                 title={isSelected ? "Убрать из нарезки" : "Добавить в нарезку"}
               >
-                {isSelected ? '✕' : '+'}
+                {isSelected ? '×' : '+'}
               </button>
             </div>
           </div>

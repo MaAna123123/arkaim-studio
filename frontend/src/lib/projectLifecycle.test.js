@@ -62,6 +62,7 @@ function createHarness(overrides = {}) {
     clearMissingProject: (project) => events.push(['missing', project]),
     receiveRecentProjects: (data) => events.push(['recent', data]),
     receiveRestart: (projectId, snapshot) => events.push(['restart', projectId, snapshot]),
+    receiveDelete: (projectId) => events.push(['delete', projectId]),
     setPendingAction: (value) => pending.push(value),
     setError: (message) => errors.push(message),
     ...overrides,
@@ -214,6 +215,22 @@ test('reset and dispose abort detail, restart, and autosave work without surfaci
   assert.equal(laterRequest.options.signal.aborted, true);
   laterRequest.reject(abortError());
   assert.equal(await later, null);
+});
+
+test('reset does not abandon an irreversible delete already accepted by the server', async () => {
+  const harness = createHarness();
+  const deletion = harness.controller.deleteProject('project-a');
+  const request = harness.transport.requests[0];
+
+  harness.controller.cancelAll();
+  assert.equal(request.options.signal.aborted, false);
+  request.resolve(response({ deleted: true, project_id: 'project-a' }));
+
+  assert.equal((await deletion).deleted, true);
+  assert.equal(
+    harness.events.some(([type, projectId]) => type === 'delete' && projectId === 'project-a'),
+    true,
+  );
 });
 
 test('restart rejects mismatched video and missing operation identity', async () => {

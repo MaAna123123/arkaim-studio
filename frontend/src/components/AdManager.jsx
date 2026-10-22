@@ -81,7 +81,7 @@ function AdSection({ apiBase, onAdStatusChange }) {
   return (
     <div>
       <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-        📺 Видео-реклама (вставляется в середину)
+        Видео-реклама (вставляется в середину)
       </div>
       {adInfo?.has_ad ? (
         <div className="ad-manager-loaded">
@@ -95,8 +95,8 @@ function AdSection({ apiBase, onAdStatusChange }) {
             />
           </div>
           <div className="ad-manager-meta">
-            <div className="ad-manager-filename">🎬 {adInfo.filename || 'Рекламный ролик'}</div>
-            <div className="ad-manager-details">⏱ {fmtDuration(adInfo.duration)} · 📦 {fmtSize(adInfo.size_bytes)}</div>
+            <div className="ad-manager-filename">{adInfo.filename || 'Рекламный ролик'}</div>
+            <div className="ad-manager-details">{fmtDuration(adInfo.duration)} · {fmtSize(adInfo.size_bytes)}</div>
             <div className="ad-manager-hint">Реклама будет вставлена в середину каждого клипа</div>
           </div>
           <div className="ad-manager-actions">
@@ -108,9 +108,9 @@ function AdSection({ apiBase, onAdStatusChange }) {
                 fileRef.current?.click();
               }}
             >
-              🔄 Заменить
+              Заменить
             </button>
-            <button type="button" className="btn btn-danger btn-sm" onClick={handleRemove}>🗑 Удалить</button>
+            <button type="button" className="btn btn-danger btn-sm" onClick={handleRemove}>Удалить</button>
           </div>
         </div>
       ) : (
@@ -125,7 +125,7 @@ function AdSection({ apiBase, onAdStatusChange }) {
             <div className="ad-manager-uploading"><div className="spinner" /><span>Загрузка...</span></div>
           ) : (
             <>
-              <div className="ad-manager-dropzone-icon">📺</div>
+              <div className="ad-manager-dropzone-icon" aria-hidden="true" />
               <div className="ad-manager-dropzone-text">Перетащите рекламный ролик или нажмите для выбора</div>
               <div className="ad-manager-dropzone-hint">MP4, MOV, MKV · Рекомендуется до 30 сек</div>
             </>
@@ -211,7 +211,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
   return (
     <div>
       <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-        🎥 Видео-баннер (зацикленный, сверху клипа)
+        Видео-баннер (зацикленный, сверху клипа)
       </div>
       <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
         Мини-видео наложится поверх каждого клипа как рекламный баннер. Видео зацикливается автоматически.
@@ -228,8 +228,8 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
             />
           </div>
           <div className="ad-manager-meta">
-            <div className="ad-manager-filename">🎥 {bannerInfo.filename || 'Видео-баннер'}</div>
-            <div className="ad-manager-details">⏱ {fmtDuration(bannerInfo.duration)} · 📦 {fmtSize(bannerInfo.size_bytes)}</div>
+            <div className="ad-manager-filename">{bannerInfo.filename || 'Видео-баннер'}</div>
+            <div className="ad-manager-details">{fmtDuration(bannerInfo.duration)} · {fmtSize(bannerInfo.size_bytes)}</div>
             <div className="ad-manager-hint">
               Баннер накладывается в верхней части каждого клипа. Размер (высота от 150 до 500 px) настраивается в блоке экспорта ниже.
             </div>
@@ -243,9 +243,9 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
                 fileRef.current?.click();
               }}
             >
-              🔄 Заменить
+              Заменить
             </button>
-            <button type="button" className="btn btn-danger btn-sm" onClick={handleRemove}>🗑 Удалить</button>
+            <button type="button" className="btn btn-danger btn-sm" onClick={handleRemove}>Удалить</button>
           </div>
         </div>
       ) : (
@@ -261,7 +261,7 @@ function BannerSection({ apiBase, onBannerStatusChange }) {
             <div className="ad-manager-uploading"><div className="spinner" /><span>Загрузка баннера...</span></div>
           ) : (
             <>
-              <div className="ad-manager-dropzone-icon">🎥</div>
+              <div className="ad-manager-dropzone-icon" aria-hidden="true" />
               <div className="ad-manager-dropzone-text">Перетащите видео-баннер или нажмите для выбора</div>
               <div className="ad-manager-dropzone-hint">MP4, MOV · Рекомендуется короткий зацикленный клип (2-10 сек)</div>
             </>
@@ -277,7 +277,7 @@ export default function AdManager({ apiBase, onAdStatusChange, onBannerStatusCha
   return (
     <div className="ad-manager">
       <div className="ad-manager-title">
-        <span className="ad-manager-icon">🎬</span>
+        <span className="ad-manager-icon" aria-hidden="true" />
         Реклама
       </div>
 

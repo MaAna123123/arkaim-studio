@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 
 const PLATFORMS = ['youtube', 'instagram', 'tiktok'];
 
-const ICONS = { youtube: '▶', instagram: '📸', tiktok: '🎵' };
+const ICONS = { youtube: 'YT', instagram: 'IG', tiktok: 'TT' };
 const NAMES = { youtube: 'YouTube', instagram: 'Instagram', tiktok: 'TikTok' };
 const COLORS = {
   youtube: { bg: 'rgba(255, 0, 0, 0.08)', border: 'rgba(255, 0, 0, 0.25)', text: '#ff4444' },
@@ -167,7 +167,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
   return (
     <div className="social-share-panel">
       <div className="social-share-title">
-        <span className="social-share-icon">🚀</span>
+        <span className="social-share-icon" aria-hidden="true" />
         Публикация в соцсети
       </div>
 
@@ -197,7 +197,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                     onClick={handleYouTubeDisconnect}
                     title="Отключить аккаунт"
                   >
-                    ✓ Авто · отключить
+                    Авто · отключить
                   </button>
                 ) : (
                   <button
@@ -211,7 +211,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                 )
               ) : (
                 <span className="social-status-connected" style={{ color: colors.text }}>
-                  ⚡ Полуавтомат
+                  Полуавтомат
                 </span>
               )}
             </div>
@@ -223,7 +223,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
       <div className="social-clips-list">
         {clipResults.map((clip, idx) => (
           <div key={`social-${clip.url}-${idx}`} className="social-clip-row">
-            <div className="social-clip-name">🎬 {clip.label}</div>
+            <div className="social-clip-name">{clip.label}</div>
             <div className="social-clip-buttons">
               {PLATFORMS.map((platform) => {
                 const colors = COLORS[platform];
@@ -266,13 +266,13 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                   </span>
                 )}
               </strong>
-              <button className="clip-preview-close" onClick={() => setModal(null)}>✕</button>
+              <button className="clip-preview-close" aria-label="Закрыть" onClick={() => setModal(null)}>×</button>
             </div>
 
             <div className="social-publish-body">
               {uploadResult?.error ? (
                 <div className="social-publish-error">
-                  <div style={{ fontSize: 32, marginBottom: 8 }}>❌</div>
+                  <div className="publish-state-mark publish-state-mark-error" aria-hidden="true">!</div>
                   <div style={{ fontWeight: 700, marginBottom: 8 }}>Ошибка публикации</div>
                   <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: 'var(--text-secondary)' }}>
                     {uploadResult.error}
@@ -280,7 +280,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                 </div>
               ) : uploadResult?.url ? (
                 <div className="social-publish-success">
-                  <div style={{ fontSize: 48, marginBottom: 12 }}>🎉</div>
+                  <div className="publish-state-mark" aria-hidden="true">OK</div>
                   <div style={{ fontWeight: 700, fontSize: 18, marginBottom: 8 }}>Видео опубликовано!</div>
                   <a href={uploadResult.url} target="_blank" rel="noopener noreferrer" className="social-publish-link">
                     {uploadResult.url}
@@ -288,7 +288,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                 </div>
               ) : uploadResult?.semi ? (
                 <div className="social-publish-success">
-                  <div style={{ fontSize: 44, marginBottom: 12 }}>📋</div>
+                  <div className="publish-state-mark" aria-hidden="true">i</div>
                   <div style={{ fontWeight: 700, fontSize: 17, marginBottom: 10 }}>
                     Клип скачан, описание скопировано
                   </div>
@@ -306,7 +306,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
               ) : (
                 <>
                   <div className="social-publish-clip-name">
-                    🎬 {modal.clip.label}
+                    {modal.clip.label}
                     <span style={{ color: 'var(--text-secondary)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
                       {modal.data.file_size_mb} МБ
                     </span>
@@ -336,10 +336,10 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
 
                   <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
                     <button className="btn btn-sm btn-secondary" onClick={() => copyText(form.title, 'title')}>
-                      {copied === 'title' ? '✓ Скопировано' : '📋 Копировать заголовок'}
+                      {copied === 'title' ? 'Скопировано' : 'Копировать заголовок'}
                     </button>
                     <button className="btn btn-sm btn-secondary" onClick={() => copyText(form.description, 'desc')}>
-                      {copied === 'desc' ? '✓ Скопировано' : '📋 Копировать описание'}
+                      {copied === 'desc' ? 'Скопировано' : 'Копировать описание'}
                     </button>
                   </div>
 
@@ -351,9 +351,9 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                         value={form.privacy}
                         onChange={(e) => setForm((f) => ({ ...f, privacy: e.target.value }))}
                       >
-                        <option value="private">🔒 Приватное</option>
-                        <option value="unlisted">🔗 По ссылке</option>
-                        <option value="public">🌍 Публичное</option>
+                        <option value="private">Приватное</option>
+                        <option value="unlisted">По ссылке</option>
+                        <option value="public">Публичное</option>
                       </select>
                     </label>
                   )}
@@ -381,7 +381,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                     disabled={uploading || !form.title.trim()}
                     onClick={handleAutoPublish}
                   >
-                    {uploading ? <><div className="spinner" /> Загружаю...</> : <>🚀 Опубликовать</>}
+                    {uploading ? <><div className="spinner" /> Загружаю...</> : <>Опубликовать</>}
                   </button>
                 ) : (
                   <button
@@ -389,7 +389,7 @@ export default function SocialSharePanel({ apiBase, clipResults }) {
                     disabled={!form.title.trim()}
                     onClick={handleSemiPublish}
                   >
-                    ⚡ Скачать клип и открыть {NAMES[modal.platform]}
+                    Скачать клип и открыть {NAMES[modal.platform]}
                   </button>
                 )
               )}

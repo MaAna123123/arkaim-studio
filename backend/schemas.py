@@ -157,6 +157,22 @@ class ExportRequest(BaseModel):
     text_ad_opacity: float = 0.75
     video_banner_enabled: bool = False
     video_banner_height: int = 380
+    streamer_layout_enabled: bool = False
+    webcam_region: NormalizedCropRegion | None = None
+    gameplay_region: NormalizedCropRegion | None = None
+    webcam_height_ratio: float = 0.35
+
+    @model_validator(mode="after")
+    def validate_streamer_layout(self):
+        if not self.streamer_layout_enabled:
+            return self
+        if self.aspect_ratio != "9:16":
+            raise ValueError("Streamer layout requires 9:16 output")
+        if self.webcam_region is None or self.gameplay_region is None:
+            raise ValueError("Streamer layout requires webcam and gameplay regions")
+        if not math.isfinite(self.webcam_height_ratio) or not 0.2 <= self.webcam_height_ratio <= 0.5:
+            raise ValueError("Webcam height ratio must be between 0.2 and 0.5")
+        return self
 
 
 class SocialUploadRequest(BaseModel):
@@ -233,3 +249,16 @@ class ProjectEditorPatch(BaseModel):
     text_ad_opacity: Any | None = None
     video_banner_enabled: Any | None = None
     video_banner_height: Any | None = None
+    streamer_layout_enabled: bool | None = None
+    webcam_region: NormalizedCropRegion | None = None
+    gameplay_region: NormalizedCropRegion | None = None
+    webcam_height_ratio: float | None = None
+
+    @model_validator(mode="after")
+    def validate_streamer_patch(self):
+        if self.webcam_height_ratio is not None and (
+            not math.isfinite(self.webcam_height_ratio)
+            or not 0.2 <= self.webcam_height_ratio <= 0.5
+        ):
+            raise ValueError("Webcam height ratio must be between 0.2 and 0.5")
+        return self

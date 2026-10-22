@@ -18,6 +18,7 @@ export default function RecentProjects({
   onOpen,
   onResume,
   onRestart,
+  onDelete,
 }) {
   if (!Array.isArray(projects) || projects.length === 0) return null;
 
@@ -27,11 +28,18 @@ export default function RecentProjects({
     run(onRestart, project);
   };
 
+  const confirmDelete = (project) => {
+    if (typeof window === 'undefined') return;
+    const title = project.title || project.filename || 'Без названия';
+    if (!window.confirm(`Удалить проект «${title}» полностью?\n\nИсходное видео, расшифровка, прогресс и все клипы будут удалены без возможности восстановления.`)) return;
+    run(onDelete, project);
+  };
+
   return (
     <section className="recent-projects" aria-labelledby="recent-projects-title">
       <div className="recent-projects-heading">
         <div>
-          <p className="arkaim-eyebrow">рабочее пространство</p>
+          <p className="arkaim-eyebrow">Сохранённые на устройстве</p>
           <h2 id="recent-projects-title">Недавние проекты</h2>
         </div>
         <span>{projects.length}</span>
@@ -44,6 +52,7 @@ export default function RecentProjects({
           });
           const title = project.title || project.filename || 'Без названия';
           const detailsOnly = !state.actions.open && state.actions.details;
+          const deleting = pendingForProject(pendingAction, project.project_id) === 'delete';
 
           return (
             <article className={`recent-project-card recent-project-card-${state.kind}`} key={project.project_id || title}>
@@ -63,14 +72,14 @@ export default function RecentProjects({
               )}
 
               <div className="recent-project-actions">
-                <button type="button" className="btn btn-secondary btn-sm" onClick={() => run(onOpen, project)}>
+                <button type="button" className="btn btn-secondary btn-sm" disabled={deleting} onClick={() => run(onOpen, project)}>
                   {detailsOnly ? 'Детали проекта' : 'Открыть'}
                 </button>
                 {state.actions.resume && (
                   <button
                     type="button"
                     className="btn btn-success btn-sm"
-                    disabled={state.actionDisabled.resume}
+                    disabled={deleting || state.actionDisabled.resume}
                     aria-label={state.resumeLabel}
                     onClick={() => run(onResume, project)}
                   >
@@ -81,12 +90,21 @@ export default function RecentProjects({
                   <button
                     type="button"
                     className="btn btn-ghost btn-sm"
-                    disabled={state.actionDisabled.restart}
+                    disabled={deleting || state.actionDisabled.restart}
                     onClick={() => confirmRestart(project)}
                   >
                     Начать заново
                   </button>
                 )}
+                <button
+                  type="button"
+                  className="btn btn-danger btn-sm"
+                  disabled={deleting}
+                  aria-label={`Удалить проект «${title}»`}
+                  onClick={() => confirmDelete(project)}
+                >
+                  {deleting ? 'Удаляю...' : 'Удалить'}
+                </button>
               </div>
             </article>
           );
